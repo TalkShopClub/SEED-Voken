@@ -1,0 +1,77 @@
+# Evaluation config for checkpoints from configs/IBQ/gpu/finetune_256.yaml.
+# Evaluates on first 20000 images under /workspace/models/EWM-DataCollection/test (recursive).
+# Run: see run_eval.sh; results to workspace/results/evals/finetune_256/
+seed_everything: true
+trainer:
+  accelerator: gpu
+  devices: 1
+
+model:
+  class_path: src.IBQ.models.ibqgan.IBQFromPretrained
+  init_args:
+    pretrained_path: "pretrained"
+    config_file: "config.yaml"
+    ckpt_file: "model.ckpt"
+    lossconfig:
+      target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_conditional: False
+        disc_in_channels: 3
+        disc_start: 0
+        disc_weight: 0.4
+        quant_loss_weight: 1.0
+        entropy_loss_weight: 0.05
+        gen_loss_weight: 0.1
+        lecam_loss_weight: 0.05
+    learning_rate: 1e-4
+    l2_normalize: False
+    use_entropy_loss: True
+    sample_minimization_weight: 1.0
+    batch_maximization_weight: 1.0
+    entropy_temperature: 0.01
+    beta: 0.25
+    use_ema: True
+    resume_lr: null
+    lr_drop_epoch: [250, 300]
+    accumulate_grad_batches: 8
+
+data:
+  class_path: finetune.DataModuleFromConfig
+  init_args:
+    batch_size: 8
+    num_workers: 4
+    train:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/eval_test_${oc.env:MAX_PATHS,20000}_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test
+          size: 256
+          random_crop: false
+          original_reso: false
+          skip_files: false
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+    validation:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/eval_test_${oc.env:MAX_PATHS,20000}_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test
+          size: 256
+          random_crop: false
+          original_reso: false
+          skip_files: false
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+    test:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/eval_test_${oc.env:MAX_PATHS,20000}_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test
+          size: 256
+          random_crop: false
+          original_reso: false
+          skip_files: false
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+
+ckpt_path: null

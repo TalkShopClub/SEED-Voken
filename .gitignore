@@ -1,0 +1,12 @@
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.pyc
+*.log
+pretrained/
+wandb/

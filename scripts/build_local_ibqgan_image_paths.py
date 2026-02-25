@@ -75,6 +75,12 @@ def main():
         action="store_true",
         help="Stream find output to JSON (low memory; use for very large dirs)",
     )
+    parser.add_argument(
+        "--max_paths",
+        type=int,
+        default=None,
+        help="Use only the first N image paths (after sorting). Useful for eval subsets (e.g. 20000).",
+    )
     args = parser.parse_args()
 
     root = args.root
@@ -116,6 +122,8 @@ def main():
             out.write(',\n  "paths": [\n')
             first = True
             for line in sort_proc.stdout:
+                if args.max_paths is not None and count >= args.max_paths:
+                    break
                 path = line.rstrip("\n")
                 if not path:
                     continue
@@ -153,6 +161,9 @@ def main():
 
     print("Scanning for images (using find)...", file=sys.stderr)
     paths = list_local_images_find(root)
+    if args.max_paths is not None:
+        paths = paths[: args.max_paths]
+        print(f"Limited to first {len(paths)} paths (--max_paths={args.max_paths})", file=sys.stderr)
     if args.relative:
         path_list = [os.path.relpath(p, root) for p in paths]
     else:

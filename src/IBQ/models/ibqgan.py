@@ -236,17 +236,24 @@ class VQModel(L.LightningModule):
         opt_disc._on_before_step = lambda: self.trainer.profiler.start("optimizer_step")
         opt_disc._on_after_step = lambda: self.trainer.profiler.stop("optimizer_step")
         ####################
+        # Manual gradient accumulation: use a counter that increments every training_step,
+        # since global_step only increments on optimizer.step() (and we use do_not_count for disc).
+        acc = self.accumulate_grad_batches
+        step_count = getattr(self, "_accum_step_count", 0)
+        self._accum_step_count = step_count + 1
+        # Start of accumulation window: clear gradients
+        if (self._accum_step_count - 1) % acc == 0:
+            opt_disc.zero_grad()
+            opt_gen.zero_grad()
         # original VQGAN first optimizes G, then D. We first optimize D then G, following traditional GAN
         # optimize discriminator
         discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
         
 
-        #opt_disc.zero_grad()
         self.manual_backward(discloss)
-        if self.global_step % self.accumulate_grad_batches == 0:
+        if self._accum_step_count % acc == 0:
             opt_disc.step()
-            opt_disc.zero_grad()
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
 
@@ -258,16 +265,14 @@ class VQModel(L.LightningModule):
             aeloss = aeloss + ocr_loss_val
             log_dict_ae["train/ocr_loss"] = ocr_loss_val.detach()
             
-        #opt_gen.zero_grad()
         self.manual_backward(aeloss)
 
 
         if self.gradient_clip_val > 0: # for cosine similarity
             self.clip_gradients(opt_gen, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm="norm")
 
-        if self.global_step % self.accumulate_grad_batches == 0:
+        if self._accum_step_count % acc == 0:
             opt_gen.step()
-            opt_gen.zero_grad()
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
         if self.scheduler_type != "None":

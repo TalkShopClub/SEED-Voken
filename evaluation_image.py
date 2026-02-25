@@ -7,7 +7,12 @@ https://github.com/mseitzer/pytorch-fid
 
 import os
 import sys
-sys.path.append(os.getcwd())
+_cwd = os.getcwd()
+sys.path.append(_cwd)
+# So that "taming" resolves to src/taming (used by IBQ OCR loss)
+_src = os.path.join(_cwd, "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 import torch
 try:
     import torch_npu
@@ -52,7 +57,11 @@ def load_config(config_path, display=False):
     return config
 
 def load_vqgan_new(config, model_type, ckpt_path=None, is_gumbel=False):
-    model = MODEL_TYPE[model_type](**config.model.init_args)
+    if hasattr(config.model, "class_path") and config.model.class_path:
+        init_args = OmegaConf.to_container(config.model.get("init_args", {}), resolve=True)
+        model = get_obj_from_str(str(config.model.class_path))(**init_args)
+    else:
+        model = MODEL_TYPE[model_type](**config.model.init_args)
     if ckpt_path is not None:
         try:
             ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -62,6 +71,8 @@ def load_vqgan_new(config, model_type, ckpt_path=None, is_gumbel=False):
                 "Try another checkpoint (e.g. an earlier epoch) or re-save the checkpoint."
             ) from e
         sd = ckpt["state_dict"]
+        # Load in fp16 to reduce memory
+        sd = {k: v.half() if v.is_floating_point() else v for k, v in sd.items()}
         missing, unexpected = model.load_state_dict(sd, strict=False)
     return model.eval()
 
@@ -149,12 +160,51 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
     return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
 
+def pad_to_encoder_multiple(batch, spatial_align):
+    """Pad a batch of images (B, C, H, W) so H and W are divisible by spatial_align.
+    Returns padded batch and crop_region (y1, x1, y2, x2) to restore original size."""
+    _, _, height, width = batch.shape
+    height_to_pad = (spatial_align - height % spatial_align) if height % spatial_align != 0 else 0
+    width_to_pad = (spatial_align - width % spatial_align) if width % spatial_align != 0 else 0
+    crop_region = (
+        height_to_pad >> 1,
+        width_to_pad >> 1,
+        height + (height_to_pad >> 1),
+        width + (width_to_pad >> 1),
+    )
+    padded = torch.nn.functional.pad(
+        batch,
+        (
+            width_to_pad >> 1,
+            width_to_pad - (width_to_pad >> 1),
+            height_to_pad >> 1,
+            height_to_pad - (height_to_pad >> 1),
+        ),
+        mode="constant",
+        value=0,
+    )
+    return padded, crop_region
+
+
+def unpad_to_region(batch, crop_region):
+    """Crop batch (B, C, H, W) to region (y1, x1, y2, x2)."""
+    y1, x1, y2, x2 = crop_region
+    return batch[:, :, y1:y2, x1:x2]
+
+
+def get_encoder_spatial_align(model):
+    """Return spatial alignment (downsample factor) required by the encoder."""
+    if hasattr(model, "encoder") and hasattr(model.encoder, "num_resolutions"):
+        return 2 ** (model.encoder.num_resolutions - 1)
+    return 16
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="inference parameters")
     parser.add_argument("--config_file", required=True, type=str)
     parser.add_argument("--ckpt_path", required=True, type=str)
-    parser.add_argument("--image_size", default=128, type=int)
-    parser.add_argument("--batch_size", default=4, type=int)
+    parser.add_argument("--image_size", default=128, type=int, help="Unused; evaluation uses native resolution.")
+    parser.add_argument("--batch_size", default=1, type=int, help="Batch size for validation (use 1 for native resolution).")
     parser.add_argument("--model", choices=["Open-MAGVIT2", "IBQ"])
     parser.add_argument(
         "--save_comparison_dir",
@@ -172,12 +222,25 @@ def get_args():
 
 def main(args):
     config_data = OmegaConf.load(args.config_file)
-    config_data.data.init_args.validation.params.config.size = args.image_size
+    OmegaConf.resolve(config_data)  # resolve ${oc.env:MAX_PATHS} etc. before dataloader uses manifest_path
+    # Native resolution: no resizing before model inference; tokenize/detokenize at original size
+    if hasattr(config_data.data.init_args.validation.params, "config"):
+        config_data.data.init_args.validation.params.config.original_reso = True
+        config_data.data.init_args.validation.params.config.size = 0
     config_data.data.init_args.batch_size = args.batch_size
 
     config_model = load_config(args.config_file, display=False)
-    model = load_vqgan_new(config_model, model_type=args.model, ckpt_path=args.ckpt_path).to(DEVICE) #please specify your own path here
-    codebook_size = config_model.model.init_args.n_embed
+    model = load_vqgan_new(config_model, model_type=args.model, ckpt_path=args.ckpt_path).to(DEVICE).half()  # fp16 inference
+    spatial_align = get_encoder_spatial_align(model)
+    _q = model.quantize
+    codebook_size = (
+        config_model.model.init_args.get("n_embed")
+        or getattr(_q, "n_embed", None)
+        or getattr(_q, "n_e", None)
+    )
+    if codebook_size is None:
+        emb = getattr(_q, "embedding", None) or getattr(_q, "embed", None)
+        codebook_size = emb.weight.shape[0] if emb is not None else 0
     
     #usage
     usage = {}
@@ -198,8 +261,8 @@ def main(args):
     pred_recs = []
 
     # LPIPS score related
-    loss_fn_alex = lpips.LPIPS(net='alex').to(DEVICE)  # best forward scores
-    loss_fn_vgg = lpips.LPIPS(net='vgg').to(DEVICE)   # closer to "traditional" perceptual loss, when used for optimization
+    loss_fn_alex = lpips.LPIPS(net='alex').to(DEVICE).eval()  # best forward scores
+    loss_fn_vgg = lpips.LPIPS(net='vgg').to(DEVICE).eval()   # closer to "traditional" perceptual loss, when used for optimization
     lpips_alex = 0.0
     lpips_vgg = 0.0
 
@@ -231,31 +294,56 @@ def main(args):
             print(f"Saving input/output comparison images to {save_dir}")
         global_idx = 0
 
-    with torch.no_grad():
+    # Inference-only: no gradients, no computation graph, minimal memory
+    torch.set_grad_enabled(False)
+    with torch.inference_mode():
         for batch in tqdm(dataset._val_dataloader()):
-            images = batch["image"].permute(0, 3, 1, 2).to(DEVICE)
+            # Detach input so we never build a graph from the dataloader
+            images = batch["image"].permute(0, 3, 1, 2).detach().to(DEVICE, non_blocking=True)  # (B, C, H, W)
+            # Resize to 0.5*H, 0.5*W
+            _, _, h, w = images.shape
+            images = torch.nn.functional.interpolate(
+                images, size=(max(1, h // 2), max(1, w // 2)), mode="bilinear", align_corners=False
+            )
             num_images += images.shape[0]
+            # Match model dtype (fp16) for encode/decode
+            images = images.half()
 
+            # Pad to encoder multiple for tokenize/detokenize at native resolution
+            images_padded, crop_region = pad_to_encoder_multiple(images, spatial_align)
             if model.use_ema:
                 with model.ema_scope():
                     if args.model == "Open-MAGVIT2":
-                        quant, diff, indices, _ = model.encode(images)
+                        quant, diff, indices, _ = model.encode(images_padded)
                     elif args.model == "IBQ":
-                        quant, qloss, (_, _, indices) = model.encode(images)
-                    reconstructed_images = model.decode(quant)
+                        quant, qloss, (_, _, indices) = model.encode(images_padded)
+                    reconstructed_padded = model.decode(quant)
             else:
                 if args.model == "Open-MAGVIT2":
-                    quant, diff, indices, _ = model.encode(images)
+                    quant, diff, indices, _ = model.encode(images_padded)
                 elif args.model == "IBQ":
-                    quant, qloss, (_, _, indices) = model.encode(images)
-                reconstructed_images = model.decode(quant)
+                    quant, qloss, (_, _, indices) = model.encode(images_padded)
+                reconstructed_padded = model.decode(quant)
 
-            reconstructed_images = reconstructed_images.clamp(-1, 1)
-            
+            reconstructed_padded = reconstructed_padded.clamp(-1, 1)
+            # Crop back to native resolution for metrics and saving
+            images = unpad_to_region(images_padded, crop_region)
+            reconstructed_images = unpad_to_region(reconstructed_padded, crop_region)
+            # Free large intermediates before metrics to reduce peak memory
+            del images_padded, reconstructed_padded, quant
+            if args.model == "IBQ":
+                del qloss
+            else:
+                del diff  # Open-MAGVIT2
+
             ### usage
             for index in indices:
                 usage[index.item()] += 1
-            
+
+            # Metrics expect float32
+            images = images.float()
+            reconstructed_images = reconstructed_images.float()
+
             # calculate lpips
             lpips_alex += loss_fn_alex(images, reconstructed_images).sum()
             lpips_vgg += loss_fn_vgg(images, reconstructed_images).sum()
@@ -300,12 +388,9 @@ def main(args):
                             warnings.warn(f"Native-resolution save failed for index {idx}: {e}")
                 global_idx += B
 
-            # calculate fid
-            pred_x = inception_model(images)[0]
-            pred_x = pred_x.squeeze(3).squeeze(2).cpu().numpy()
-            pred_rec = inception_model(reconstructed_images)[0]
-            pred_rec = pred_rec.squeeze(3).squeeze(2).cpu().numpy()
-
+            # calculate fid (move to numpy immediately to free GPU memory)
+            pred_x = inception_model(images)[0].squeeze(3).squeeze(2).cpu().numpy()
+            pred_rec = inception_model(reconstructed_images)[0].squeeze(3).squeeze(2).cpu().numpy()
             pred_xs.append(pred_x)
             pred_recs.append(pred_rec)
 
@@ -349,7 +434,22 @@ def main(args):
     print("SSIM: ", ssim_value)
     print("PSNR: ", psnr_value)
     print("utilization", utilization)
-  
+
+    save_dir = getattr(args, "save_comparison_dir", None)
+    if save_dir:
+        save_dir = os.path.expanduser(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
+        summary_path = os.path.join(save_dir, "summary.txt")
+        with open(summary_path, "w") as f:
+            f.write(f"FID: {fid_value}\n")
+            f.write(f"LPIPS_ALEX: {lpips_alex_value.item()}\n")
+            f.write(f"LPIPS_VGG: {lpips_vgg_value.item()}\n")
+            f.write(f"SSIM: {ssim_value}\n")
+            f.write(f"PSNR: {psnr_value}\n")
+            f.write(f"utilization: {utilization}\n")
+            f.write(f"num_images: {num_images}\n")
+        print(f"Summary written to {summary_path}")
+
 if __name__ == "__main__":
     args = get_args()
     main(args)
