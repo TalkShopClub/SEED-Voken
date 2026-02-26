@@ -7,7 +7,7 @@ trainer:
   strategy: ddp_find_unused_parameters_true
   devices: 1
   num_nodes: 1
-  precision: 16-mixed
+  precision: bf16-mixed
   max_epochs: 350
   check_val_every_n_epoch: 1
   num_sanity_val_steps: 0
@@ -86,7 +86,7 @@ data:
         config:
           manifest_path: configs/IBQ/gpu/local_ibqgan_val_256_image_paths.json
           root: /workspace/models/EWM-DataCollection/test
-          size: 512
+          size: 384
           random_crop: false
           original_reso: false
           skip_files: true
@@ -97,7 +97,7 @@ data:
         config:
           manifest_path: configs/IBQ/gpu/local_ibqgan_test_256_image_paths.json
           root: /workspace/models/EWM-DataCollection/test
-          size: 512
+          size: 384
           random_crop: false
           original_reso: false
           skip_files: true
