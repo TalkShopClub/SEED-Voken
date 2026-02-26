@@ -7,7 +7,6 @@ from torch.utils.data import Dataset, ConcatDataset, IterableDataset, get_worker
 from torchvision.io import read_image
 from PIL import Image
 
-
 def load_image(path):
     """Load image as (C, H, W) uint8 tensor. Falls back to PIL when torchvision raises
     (e.g. 'At most 8-bit PNG images are supported' for 16-bit PNG or mislabeled files)."""
@@ -45,12 +44,15 @@ class ImagePaths(Dataset):
         self._length = len(paths)
 
         if self.size is not None and self.size > 0:
-            self.rescaler = albumentations.SmallestMaxSize(max_size = self.size)
             if not self.random_crop:
-                self.cropper = albumentations.CenterCrop(height=self.size,width=self.size)
+                self.cropper = albumentations.CenterCrop(height=self.size, width=self.size)
             else:
-                self.cropper = albumentations.RandomCrop(height=self.size,width=self.size)
-            self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
+                self.cropper = albumentations.RandomCrop(height=self.size, width=self.size)
+            # Ensure crop size never exceeds image size: resize so smallest side >= size first
+            self.preprocessor = albumentations.Compose([
+                albumentations.SmallestMaxSize(max_size=self.size),
+                self.cropper,
+            ])
         else:
             self.preprocessor = lambda **kwargs: kwargs
 
@@ -58,11 +60,13 @@ class ImagePaths(Dataset):
         return self._length
 
     def preprocess_image(self, image_path):
-        image = load_image(image_path)  # (C, H, W) uint8
+        image = load_image(image_path)  # (C, H, W) uint8, or (T, C, H, W) for multi-frame
         if image.shape[0] == 1:
             image = image.repeat(3, 1, 1)
         elif image.shape[0] == 4:
             image = image[:3]
+        if len(image.shape) == 4:  # multi-frame: torchvision returns (T, C, H, W), take first frame
+            image = image[0]
         image = image.permute(1, 2, 0).numpy().astype(np.uint8)
         if not self.original_reso:
             image = self.preprocessor(image=image)["image"]
@@ -89,12 +93,15 @@ class IterableImagePaths(IterableDataset):
         self.labels["file_path_"] = paths
         self._length = len(paths)
         if self.size is not None and self.size > 0:
-            self.rescaler = albumentations.SmallestMaxSize(max_size=self.size)
             if not self.random_crop:
                 self.cropper = albumentations.CenterCrop(height=self.size, width=self.size)
             else:
                 self.cropper = albumentations.RandomCrop(height=self.size, width=self.size)
-            self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
+            # Ensure crop size never exceeds image size: resize so smallest side >= size first
+            self.preprocessor = albumentations.Compose([
+                albumentations.SmallestMaxSize(max_size=self.size),
+                self.cropper,
+            ])
         else:
             self.preprocessor = lambda **kwargs: kwargs
 
@@ -107,7 +114,12 @@ class IterableImagePaths(IterableDataset):
             image = image.repeat(3, 1, 1)
         elif image.shape[0] == 4:
             image = image[:3]
-        image = image.permute(1, 2, 0).numpy().astype(np.uint8)
+        if len(image.shape) == 4:  # multi-frame: torchvision returns (T, C, H, W), take first frame
+            image = image[0]
+        try:
+            image = image.permute(1, 2, 0).numpy().astype(np.uint8)
+        except Exception as e:
+            raise ValueError(f"Error processing image {image_path}: {e}")
         if not self.original_reso:
             image = self.preprocessor(image=image)["image"]
         image = (image/127.5 - 1.0).astype(np.float32)

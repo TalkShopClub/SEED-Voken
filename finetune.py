@@ -25,7 +25,7 @@ from torch.utils.data import random_split, DataLoader, Dataset, IterableDataset
 
 import lightning as L
 from lightning.pytorch.cli import LightningCLI
-from lightning.pytorch.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, Callback, LearningRateMonitor, TQDMProgressBar
 from lightning.pytorch.loggers import WandbLogger
 from lightning import seed_everything
 
@@ -174,6 +174,30 @@ class WandbLoggerCallback(Callback):
         self._ensure_wandb_logger(trainer)
 
 
+class TotalLossProgressBar(TQDMProgressBar):
+    """Progress bar that includes total training loss (ae + disc) in the display."""
+
+    def get_metrics(self, trainer, pl_module):
+        items = super().get_metrics(trainer, pl_module)
+        # Add total training loss from logged metrics (ae total + disc loss)
+        cm = trainer.callback_metrics
+        total = None
+        if "train/total_loss" in cm and "train/disc_loss" in cm:
+            v_ae, v_disc = cm["train/total_loss"], cm["train/disc_loss"]
+            total = (v_ae.item() if hasattr(v_ae, "item") else v_ae) + (
+                v_disc.item() if hasattr(v_disc, "item") else v_disc
+            )
+        elif "train/total_loss" in cm:
+            v = cm["train/total_loss"]
+            total = v.item() if hasattr(v, "item") else v
+        elif "train/disc_loss" in cm:
+            v = cm["train/disc_loss"]
+            total = v.item() if hasattr(v, "item") else v
+        if total is not None:
+            items["loss"] = f"{total:.4f}"
+        return items
+
+
 class FinetuneCLI(LightningCLI):
     """CLI that adds WandbLogger for training and evaluation logging."""
 
@@ -187,13 +211,14 @@ class FinetuneCLI(LightningCLI):
         )
 
     def before_instantiate_classes(self) -> None:
-        # Inject callback that adds WandbLogger (avoids modifying jsonargparse Namespace config)
+        # Inject callbacks: progress bar with total loss, and WandbLogger
         sub = getattr(self.config, str(self.subcommand), None) if self.subcommand else None
         wandb_project = getattr(sub, "wandb_project", None) or getattr(
             self.config, "wandb_project", "seed-voken-finetune"
         )
         defaults = self.trainer_defaults or {}
         extra_callbacks = list(defaults.get("callbacks", []))
+        extra_callbacks.append(TotalLossProgressBar())
         extra_callbacks.append(WandbLoggerCallback(project=wandb_project))
         self.trainer_defaults = {**defaults, "callbacks": extra_callbacks}
 

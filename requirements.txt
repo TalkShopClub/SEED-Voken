@@ -1,5 +1,10 @@
-torch==2.1.1 --index-url https://download.pytorch.org/whl/cu118
-torchvision==0.16.1 --index-url https://download.pytorch.org/whl/cu118
+# RTX 5090 (Blackwell / sm_120) needs CUDA 12.8 and PyTorch 2.7+. Python 3.9+ required.
+# If "No matching distribution found" with --index-url cu128, try:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple/
+# Or one-shot (cu128 wheels preferred when available):
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+torchvision>=0.22.0
 lightning==2.2.0
 jsonargparse[signatures]==4.26.1
 tensorboard

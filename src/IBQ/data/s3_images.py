@@ -10,6 +10,7 @@ from botocore.exceptions import ClientError
 
 from src.IBQ.util import retrieve, KeyNotFoundError
 from src.IBQ.data.base import IterableImagePaths, load_image
+from src.IBQ.data.image_resize import SmartResize
 from src.manifest_utils import (
     ensure_manifest,
     get_failed_samples_path_from_manifest,
@@ -43,12 +44,17 @@ class S3ImagePaths(IterableDataset):
         self.labels["file_path_"] = s3_keys
         self._length = len(s3_keys)
         if self.size is not None and self.size > 0:
-            self.rescaler = albumentations.SmallestMaxSize(max_size=self.size)
+            self.rescaler = SmartResize(area=self.size * self.size, ds_factor=16)
             if not self.random_crop:
                 self.cropper = albumentations.CenterCrop(height=self.size, width=self.size)
             else:
                 self.cropper = albumentations.RandomCrop(height=self.size, width=self.size)
-            self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
+            # Ensure crop size never exceeds image size (SmartResize may leave small images unchanged)
+            self.preprocessor = albumentations.Compose([
+                self.rescaler,
+                albumentations.SmallestMaxSize(max_size=self.size),
+                self.cropper,
+            ])
         else:
             self.preprocessor = lambda **kwargs: kwargs
 

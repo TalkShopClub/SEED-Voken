@@ -1,0 +1,106 @@
+# Fine-tune from same checkpoint as finetune_256_ocr, with smart_resize and 2x learning rate.
+# Same pretrained_path/config/ckpt and OCR loss as finetune_256_ocr; data uses SmartResize (area=size², ds_factor=16), lr=2e-4.
+# Run: python finetune.py fit -c configs/IBQ/gpu/finetune_256_ocr_smart_resize.yaml
+seed_everything: true
+trainer:
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  devices: 1
+  num_nodes: 1
+  precision: 16-mixed
+  max_epochs: 350
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  log_every_n_steps: 100
+  limit_train_batches: 25000
+  limit_val_batches: 1250
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/vqgan/ibq_finetune_ocr_smart_resize"
+        save_top_k: -1
+        save_last: True
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: "../../results/vqgan/ibq_finetune_ocr_smart_resize"
+      version: "test"
+      name:
+
+model:
+  class_path: src.IBQ.models.ibqgan.IBQFromPretrained
+  init_args:
+    pretrained_path: "pretrained"
+    config_file: "config.yaml"
+    ckpt_file: "model.ckpt"
+    lossconfig:
+      target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_conditional: False
+        disc_in_channels: 3
+        disc_start: 0
+        disc_weight: 0.4
+        quant_loss_weight: 1.0
+        entropy_loss_weight: 0.05
+        gen_loss_weight: 0.1
+        lecam_loss_weight: 0.05
+    learning_rate: 1e-4  # 2x base (1e-4 -> 2e-4)
+    scheduler_type: "cosine_annealing"
+    warmup_epochs: 5
+    min_learning_rate: 1e-6
+    l2_normalize: False
+    use_entropy_loss: True
+    sample_minimization_weight: 1.0
+    batch_maximization_weight: 1.0
+    entropy_temperature: 0.01
+    beta: 0.25
+    use_ema: True
+    resume_lr: null
+    lr_drop_epoch: [250, 300]
+    ocr_loss: true
+    accumulate_grad_batches: 8
+    gradient_clip_val: 1.0
+
+data:
+  class_path: finetune.DataModuleFromConfig
+  init_args:
+    batch_size: 1
+    num_workers: 16
+    train:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_ibqgan_train_256_image_paths.json
+          root: /workspace/models/EWM-DataCollection/images
+          size: 384  # SmartResize area=256², ds_factor=16 (matches pretrained 256 resolution)
+          random_crop: true
+          original_reso: false
+          skip_files: true
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+    validation:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_ibqgan_val_256_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test
+          size: 512
+          random_crop: false
+          original_reso: false
+          skip_files: true
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+    test:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_ibqgan_test_256_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test
+          size: 512
+          random_crop: false
+          original_reso: false
+          skip_files: true
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+
+ckpt_path: null # to resume

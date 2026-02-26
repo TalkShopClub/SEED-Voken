@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, IterableDataset
 from torchvision.io import decode_image
 
 from src.IBQ.data.base import IterableImagePaths, load_image
+from src.IBQ.data.image_resize import SmartResize
 from src.IBQ.util import download, retrieve
 import src.IBQ.data.utils as bdu
 
@@ -262,8 +263,10 @@ def get_preprocessor(size=None, random_crop=False, additional_targets=None,
                      crop_size=None):
     if size is not None and size > 0:
         transforms = list()
-        rescaler = albumentations.SmallestMaxSize(max_size = size)
+        rescaler = SmartResize(area=size * size, ds_factor=16)
         transforms.append(rescaler)
+        # Ensure crop size never exceeds image size
+        transforms.append(albumentations.SmallestMaxSize(max_size=size))
         if not random_crop:
             cropper = albumentations.CenterCrop(height=size,width=size)
             transforms.append(cropper)
@@ -275,11 +278,14 @@ def get_preprocessor(size=None, random_crop=False, additional_targets=None,
         preprocessor = albumentations.Compose(transforms,
                                               additional_targets=additional_targets)
     elif crop_size is not None and crop_size > 0:
+        transforms = [
+            albumentations.SmallestMaxSize(max_size=crop_size),
+        ]
         if not random_crop:
             cropper = albumentations.CenterCrop(height=crop_size,width=crop_size)
         else:
             cropper = albumentations.RandomCrop(height=crop_size,width=crop_size)
-        transforms = [cropper]
+        transforms.append(cropper)
         preprocessor = albumentations.Compose(transforms,
                                               additional_targets=additional_targets)
     else:
@@ -311,7 +317,7 @@ class BaseWithDepth(Dataset):
         self.crop_size = crop_size
         if self.crop_size is not None:
             self.rescaler = albumentations.Compose(
-                [albumentations.SmallestMaxSize(max_size = self.crop_size)],
+                [SmartResize(area=self.crop_size * self.crop_size, ds_factor=16)],
                 additional_targets={"depth": "image"})
         if root is not None:
             self.DEFAULT_DEPTH_ROOT = root
@@ -481,13 +487,13 @@ class ImageNetScale(Dataset):
         transforms = list()
 
         if self.size is not None and self.size > 0:
-            rescaler = albumentations.SmallestMaxSize(max_size = self.size)
+            rescaler = SmartResize(area=self.size * self.size, ds_factor=16)
             self.rescaler = rescaler
             transforms.append(rescaler)
 
         if self.crop_size is not None and self.crop_size > 0:
             if len(transforms) == 0:
-                self.rescaler = albumentations.SmallestMaxSize(max_size = self.crop_size)
+                self.rescaler = SmartResize(area=self.crop_size * self.crop_size, ds_factor=16)
 
             if not self.random_crop:
                 cropper = albumentations.CenterCrop(height=self.crop_size,width=self.crop_size)

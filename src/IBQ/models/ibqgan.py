@@ -1,3 +1,11 @@
+import sys
+from pathlib import Path
+
+# Add src/ so that taming package (src/taming/) is importable
+_src = Path(__file__).resolve().parent.parent.parent
+if str(_src) not in sys.path:
+    sys.path.insert(0, str(_src))
+
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -224,6 +232,9 @@ class VQModel(L.LightningModule):
     # refer to https://lightning.ai/docs/pytorch/stable/model/manual_optimization.html
     def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
+
+        if torch.any(x.isnan()): # skip batch if any value is nan
+            return None
         xrec, qloss = self(x)
 
         opt_gen, opt_disc = self.optimizers()
@@ -247,12 +258,16 @@ class VQModel(L.LightningModule):
             opt_gen.zero_grad()
         # original VQGAN first optimizes G, then D. We first optimize D then G, following traditional GAN
         # optimize discriminator
-        discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
+        discloss, log_dict_disc = self.loss(qloss.detach(), x, xrec.detach(), 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
-        
+
+        if torch.isnan(discloss):
+            import pdb; pdb.set_trace()
 
         self.manual_backward(discloss)
         if self._accum_step_count % acc == 0:
+            if self.gradient_clip_val > 0:
+                self.clip_gradients(opt_disc, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm="norm")
             opt_disc.step()
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
@@ -273,11 +288,10 @@ class VQModel(L.LightningModule):
 
         if self._accum_step_count % acc == 0:
             opt_gen.step()
+            if self.scheduler_type != "None":
+                scheduler_disc.step()
+                scheduler_gen.step()
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-
-        if self.scheduler_type != "None":
-            scheduler_disc.step()
-            scheduler_gen.step()
 
     def validation_step(self, batch, batch_idx):
         if self.use_ema:
@@ -307,6 +321,12 @@ class VQModel(L.LightningModule):
 
     def configure_optimizers(self):
         lr = self.learning_rate
+        if self.trainer.is_global_zero:
+            print(
+                "[IBQGAN] configure_optimizers: learning_rate={}, scheduler_type={}, warmup_epochs={}, min_learning_rate={}, lr_drop_epoch={}".format(
+                    lr, self.scheduler_type, self.warmup_epochs, self.min_learning_rate, self.lr_drop_epoch
+                )
+            )
         opt_gen = torch.optim.Adam(list(self.encoder.parameters()) +
                                    list(self.decoder.parameters()) +
                                    list(self.quantize.parameters()) +
@@ -322,11 +342,26 @@ class VQModel(L.LightningModule):
                 {"optimizer": opt_disc, "do_not_count_global_step": True},
             )
 
+        # Batches per epoch: full dataloader length (per process), capped by limit_train_batches
+        batches_per_epoch_raw = len(self.trainer.datamodule._train_dataloader()) // self.trainer.world_size
+        limit = self.trainer.limit_train_batches
+        if isinstance(limit, int):
+            batches_per_epoch = min(batches_per_epoch_raw, limit)
+        elif isinstance(limit, float) and 0 < limit <= 1:
+            batches_per_epoch = int(batches_per_epoch_raw * limit)
+        else:
+            batches_per_epoch = batches_per_epoch_raw
+        # Scheduler is stepped once per optimizer step (every accumulate_grad_batches batches)
+        optimizer_steps_per_epoch = max(1, batches_per_epoch // self.accumulate_grad_batches)
+        warmup_steps = optimizer_steps_per_epoch * self.warmup_epochs
+        training_steps = optimizer_steps_per_epoch * self.trainer.max_epochs
+
         if self.trainer.is_global_zero:
-            print("step_per_epoch: {}".format(len(self.trainer.datamodule._train_dataloader()) // self.trainer.world_size))
-        step_per_epoch  = len(self.trainer.datamodule._train_dataloader()) // self.trainer.world_size
-        warmup_steps = step_per_epoch * self.warmup_epochs
-        training_steps = step_per_epoch * self.trainer.max_epochs
+            print(
+                "scheduler: batches_per_epoch={}, optimizer_steps_per_epoch={}, warmup_steps={}, training_steps={}".format(
+                    batches_per_epoch, optimizer_steps_per_epoch, warmup_steps, training_steps
+                )
+            )
 
         if self.scheduler_type == "linear-warmup":
             scheduler_ae = torch.optim.lr_scheduler.LambdaLR(opt_gen, Scheduler_LinearWarmup(warmup_steps))
@@ -336,8 +371,17 @@ class VQModel(L.LightningModule):
             multipler_min = self.min_learning_rate / self.learning_rate
             scheduler_ae = torch.optim.lr_scheduler.LambdaLR(opt_gen, Scheduler_LinearWarmup_CosineDecay(warmup_steps=warmup_steps, max_steps=training_steps, multipler_min=multipler_min))
             scheduler_disc = torch.optim.lr_scheduler.LambdaLR(opt_disc, Scheduler_LinearWarmup_CosineDecay(warmup_steps=warmup_steps, max_steps=training_steps, multipler_min=multipler_min))
+
+        elif self.scheduler_type == "cosine_annealing":
+            # Step-based cosine annealing: LR from learning_rate to min_learning_rate over training_steps
+            scheduler_ae = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_gen, T_max=training_steps, eta_min=self.min_learning_rate
+            )
+            scheduler_disc = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_disc, T_max=training_steps, eta_min=self.min_learning_rate
+            )
         else:
-            raise NotImplementedError()
+            raise NotImplementedError("scheduler_type must be one of: None, linear-warmup, linear-warmup_cosine-decay, cosine_annealing")
         return {"optimizer": opt_gen, "lr_scheduler": scheduler_ae}, {"optimizer": opt_disc, "lr_scheduler": scheduler_disc}
 
     def get_last_layer(self):
