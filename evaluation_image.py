@@ -216,7 +216,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="inference parameters")
     parser.add_argument("--config_file", required=True, type=str)
     parser.add_argument("--ckpt_path", required=True, type=str)
-    parser.add_argument("--image_size", default=128, type=int, help="Unused; evaluation uses native resolution.")
+    parser.add_argument("--image_size", default=1.0, type=float, help="Scale factor for H and W (default 1 = native resolution).")
     parser.add_argument("--batch_size", default=1, type=int, help="Batch size for validation (use 1 for native resolution).")
     parser.add_argument("--model", choices=["Open-MAGVIT2", "IBQ"])
     parser.add_argument(
@@ -313,10 +313,12 @@ def main(args):
         for batch in tqdm(dataset._val_dataloader()):
             # Detach input so we never build a graph from the dataloader
             images = batch["image"].permute(0, 3, 1, 2).detach().to(DEVICE, non_blocking=True)  # (B, C, H, W)
-            # Resize to 0.5*H, 0.5*W
+            # Resize by scalar factor image_size (1 = native resolution)
             _, _, h, w = images.shape
+            scale = args.image_size
+            new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
             images = torch.nn.functional.interpolate(
-                images, size=(max(1, h // 2), max(1, w // 2)), mode="bilinear", align_corners=False
+                images, size=(new_h, new_w), mode="bilinear", align_corners=False
             )
             num_images += images.shape[0]
             # Match model dtype (fp16) for encode/decode
