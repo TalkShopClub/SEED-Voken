@@ -1,0 +1,104 @@
+# Fine-tune from pretrained checkpoint on pre-cropped 256x256 data in /workspace/test_img.
+# Resizing is effectively bypassed by using exact 256x256 images and setting size=256.
+# Run: python finetune.py fit -c configs/IBQ/gpu/finetune_256_ocr_test_img_no_resize.yaml
+seed_everything: true
+trainer:
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  devices: 1
+  num_nodes: 1
+  precision: 16-mixed
+  max_epochs: 350
+  check_val_every_n_epoch: null
+  val_check_interval: 25000
+  num_sanity_val_steps: 0
+  log_every_n_steps: 100
+  limit_val_batches: 1250
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/vqgan/ibq_finetune_ocr_test_img_no_resize"
+        save_top_k: -1
+        save_last: True
+        every_n_train_steps: 25000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: "../../results/vqgan/ibq_finetune_ocr_test_img_no_resize"
+      version: "test"
+      name:
+
+model:
+  class_path: src.IBQ.models.ibqgan.IBQFromPretrained
+  init_args:
+    pretrained_path: "pretrained"
+    config_file: "config.yaml"
+    ckpt_file: "model.ckpt"
+    lossconfig:
+      target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_conditional: False
+        disc_in_channels: 3
+        disc_start: 0
+        disc_weight: 0.4
+        quant_loss_weight: 1.0
+        entropy_loss_weight: 0.05
+        gen_loss_weight: 0.1
+        lecam_loss_weight: 0.05
+    learning_rate: 3e-4
+    scheduler_type: None #"cosine_annealing"
+    warmup_epochs: 5
+    min_learning_rate: 1e-6
+    l2_normalize: False
+    use_entropy_loss: True
+    sample_minimization_weight: 1.0
+    batch_maximization_weight: 1.0
+    entropy_temperature: 0.01
+    beta: 0.25
+    use_ema: True
+    resume_lr: null
+    lr_drop_epoch: [250, 300]
+    ocr_loss: true
+    accumulate_grad_batches: 768
+    gradient_clip_val: 1.0
+
+data:
+  class_path: finetune.DataModuleFromConfig
+  init_args:
+    batch_size: 1
+    num_workers: 16
+    train:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_ibqgan_train_test_img_256_image_paths.json
+          root: /workspace/test_img/train
+          size: 256
+          random_crop: true
+          original_reso: false
+          skip_files: false
+    validation:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_ibqgan_val_test_img_256_image_paths.json
+          root: /workspace/test_img/val
+          size: 256
+          random_crop: false
+          original_reso: false
+          skip_files: false
+    test:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_ibqgan_test_test_img_256_image_paths.json
+          root: /workspace/test_img/test
+          size: 256
+          random_crop: false
+          original_reso: false
+          skip_files: false
+
+ckpt_path: null
