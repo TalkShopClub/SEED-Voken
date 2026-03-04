@@ -1,6 +1,5 @@
 import os
 import numpy as np
-import torch
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 import albumentations
@@ -9,14 +8,14 @@ import random
 from botocore.exceptions import ClientError
 
 from src.IBQ.util import retrieve, KeyNotFoundError
-from src.IBQ.data.base import IterableImagePaths, load_image
+from src.IBQ.data.base import IterableImagePaths, load_image, load_image_bytes
 from src.IBQ.data.image_resize import SmartResize
 from src.manifest_utils import (
     ensure_manifest,
     get_failed_samples_path_from_manifest,
     load_failed_paths,
 )
-from torchvision.io import decode_image, write_png
+from torchvision.io import write_png
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -77,7 +76,7 @@ class S3ImagePaths(IterableDataset):
         try:
             response = self.s3_client.get_object(Bucket=self.bucket, Key=s3_key)
             image_data = response['Body'].read()
-            image = decode_image(torch.frombuffer(memoryview(image_data), dtype=torch.uint8), mode="RGB")
+            image = load_image_bytes(image_data, source_hint=s3_key)
             if self.cache_dir is not None:
                 safe_key = s3_key.replace("\\", "/")
                 cache_path = os.path.join(self.cache_dir, safe_key)
@@ -103,7 +102,13 @@ class S3ImagePaths(IterableDataset):
 
     def _get_sample(self, i):
         example = dict()
-        example["image"] = self.preprocess_image(self.labels["file_path_"][i])
+        try:
+            example["image"] = self.preprocess_image(self.labels["file_path_"][i])
+            example["image_load_failed"] = False
+        except (OSError, IOError, RuntimeError, ValueError, FileNotFoundError) as e:
+            size = self.size if self.size else 256
+            example["image"] = np.full((size, size, 3), -1.0, dtype=np.float32)
+            example["image_load_failed"] = True
         for k in self.labels:
             example[k] = self.labels[k][i]
         return example

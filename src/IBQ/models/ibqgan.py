@@ -95,6 +95,7 @@ class VQModel(L.LightningModule):
 
         self.strict_loading = False
         self._skip_reasons = [
+            "image_retrieval_failed",
             "non_finite_input",
             "non_finite_input_std",
             "low_std_input",
@@ -295,6 +296,15 @@ class VQModel(L.LightningModule):
     # refer to https://lightning.ai/docs/pytorch/stable/model/manual_optimization.html
     def training_step(self, batch, batch_idx):
         self._ensure_ocr_lpips_frozen_eval()
+        # Skip batch if any sample in the batch failed to load (e.g. truncated image)
+        load_failed = batch.get("image_load_failed")
+        if load_failed is not None:
+            if torch.is_tensor(load_failed) and load_failed.any():
+                self._record_skip("train", "image_retrieval_failed")
+                return None
+            if isinstance(load_failed, (list, tuple)) and any(load_failed):
+                self._record_skip("train", "image_retrieval_failed")
+                return None
         x = self.get_input(batch, self.image_key)
 
         if not self._all_finite(x): # skip batch if any value is nan/inf
@@ -393,6 +403,14 @@ class VQModel(L.LightningModule):
 
     def _validation_step(self, batch, batch_idx, suffix=""):
         self._ensure_ocr_lpips_frozen_eval()
+        load_failed = batch.get("image_load_failed")
+        if load_failed is not None:
+            if torch.is_tensor(load_failed) and load_failed.any():
+                self._record_skip("val", "image_retrieval_failed")
+                return {}
+            if isinstance(load_failed, (list, tuple)) and any(load_failed):
+                self._record_skip("val", "image_retrieval_failed")
+                return {}
         x = self.get_input(batch, self.image_key)
 
         if not self._all_finite(x):
@@ -436,7 +454,7 @@ class VQModel(L.LightningModule):
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
-        return self.log_dict
+        return {}
 
     def configure_optimizers(self):
         lr = self.learning_rate

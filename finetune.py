@@ -198,6 +198,20 @@ class TotalLossProgressBar(TQDMProgressBar):
         return items
 
 
+class SetIterableDatasetEpoch(Callback):
+    """Set train IterableDataset.data.epoch to current_epoch at epoch start.
+    Ensures each epoch gets a different shuffle order (IterableImagePaths uses epoch in RNG seed).
+    Does not fix mid-epoch resume: if you resume from a checkpoint saved mid-epoch, the dataloader
+    restarts from the beginning of that epoch so some batches are seen twice in that epoch."""
+    def on_train_epoch_start(self, trainer, pl_module):
+        dm = trainer.datamodule
+        if not hasattr(dm, "datasets") or "train" not in dm.datasets:
+            return
+        ds = dm.datasets["train"]
+        if hasattr(ds, "data") and hasattr(ds.data, "epoch"):
+            ds.data.epoch = trainer.current_epoch
+
+
 class FinetuneCLI(LightningCLI):
     """CLI that adds WandbLogger for training and evaluation logging."""
 
@@ -211,7 +225,7 @@ class FinetuneCLI(LightningCLI):
         )
 
     def before_instantiate_classes(self) -> None:
-        # Inject callbacks: progress bar with total loss, and WandbLogger
+        # Inject callbacks: progress bar with total loss, WandbLogger, and epoch for IterableDataset
         sub = getattr(self.config, str(self.subcommand), None) if self.subcommand else None
         wandb_project = getattr(sub, "wandb_project", None) or getattr(
             self.config, "wandb_project", "seed-voken-finetune"
@@ -220,6 +234,7 @@ class FinetuneCLI(LightningCLI):
         extra_callbacks = list(defaults.get("callbacks", []))
         extra_callbacks.append(TotalLossProgressBar())
         extra_callbacks.append(WandbLoggerCallback(project=wandb_project))
+        extra_callbacks.append(SetIterableDatasetEpoch())
         self.trainer_defaults = {**defaults, "callbacks": extra_callbacks}
 
 

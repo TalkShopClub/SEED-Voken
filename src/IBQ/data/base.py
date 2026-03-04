@@ -1,4 +1,6 @@
 import bisect
+import io
+import os
 import random
 import numpy as np
 import torch
@@ -7,15 +9,54 @@ from torch.utils.data import Dataset, ConcatDataset, IterableDataset, get_worker
 from torchvision.io import read_image
 from PIL import Image
 
+_PIL_FIRST_EXTENSIONS = {".png"}
+
+
+def _load_image_with_pil_path(path):
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        arr = np.array(img, dtype=np.uint8)
+    return torch.from_numpy(arr).permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
+
+
+def _load_image_with_pil_bytes(image_data):
+    with Image.open(io.BytesIO(image_data)) as img:
+        img = img.convert("RGB")
+        arr = np.array(img, dtype=np.uint8)
+    return torch.from_numpy(arr).permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
+
+
 def load_image(path):
-    """Load image as (C, H, W) uint8 tensor. Falls back to PIL when torchvision raises
-    (e.g. 'At most 8-bit PNG images are supported' for 16-bit PNG or mislabeled files)."""
+    """Load image as (C, H, W) uint8 tensor.
+
+    PNGs are decoded with PIL first to avoid known torchvision/libpng failures on
+    malformed iCCP metadata. Other formats use torchvision first and PIL fallback.
+    """
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    if ext in _PIL_FIRST_EXTENSIONS:
+        try:
+            return _load_image_with_pil_path(path)
+        except Exception:
+            return read_image(path)
     try:
         return read_image(path)
-    except RuntimeError:
-        img = Image.open(path).convert("RGB")
-        arr = np.array(img, dtype=np.uint8)
-        return torch.from_numpy(arr).permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
+    except Exception:
+        return _load_image_with_pil_path(path)
+
+
+def load_image_bytes(image_data, source_hint=""):
+    """Load image bytes as (C, H, W) uint8 tensor with torchvision->PIL fallback."""
+    hint = source_hint.lower() if source_hint else ""
+    if hint.endswith(".png"):
+        try:
+            return _load_image_with_pil_bytes(image_data)
+        except Exception:
+            pass
+    try:
+        return read_image(torch.frombuffer(memoryview(image_data), dtype=torch.uint8))
+    except Exception:
+        return _load_image_with_pil_bytes(image_data)
 
 
 class ConcatDatasetWithIndex(ConcatDataset):
@@ -75,7 +116,14 @@ class ImagePaths(Dataset):
 
     def __getitem__(self, i):
         example = dict()
-        example["image"] = self.preprocess_image(self.labels["file_path_"][i])
+        try:
+            example["image"] = self.preprocess_image(self.labels["file_path_"][i])
+            example["image_load_failed"] = False
+        except (OSError, IOError, RuntimeError, ValueError) as e:
+            # Placeholder so collate and training_step can run; training_step will skip the batch
+            size = self.size if self.size else 256
+            example["image"] = np.full((size, size, 3), -1.0, dtype=np.float32)
+            example["image_load_failed"] = True
         for k in self.labels:
             example[k] = self.labels[k][i]
         return example
@@ -127,8 +175,13 @@ class IterableImagePaths(IterableDataset):
 
     def _get_sample(self, i):
         example = dict()
-
-        example["image"] = self.preprocess_image(self.labels["file_path_"][i])
+        try:
+            example["image"] = self.preprocess_image(self.labels["file_path_"][i])
+            example["image_load_failed"] = False
+        except (OSError, IOError, RuntimeError, ValueError) as e:
+            size = self.size if self.size else 256
+            example["image"] = np.full((size, size, 3), -1.0, dtype=np.float32)
+            example["image_load_failed"] = True
         for k in self.labels:
             example[k] = self.labels[k][i]
         return example

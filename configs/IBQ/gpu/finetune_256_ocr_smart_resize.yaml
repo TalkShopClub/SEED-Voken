@@ -1,18 +1,20 @@
 # Fine-tune from same checkpoint as finetune_256_ocr, with smart_resize and 2x learning rate.
 # Same pretrained_path/config/ckpt and OCR loss as finetune_256_ocr; data uses SmartResize (area=size², ds_factor=16), lr=2e-4.
 # Run: python finetune.py fit -c configs/IBQ/gpu/finetune_256_ocr_smart_resize.yaml
+#
+# Training: one full epoch per epoch (no limit_train_batches). Validation + checkpoint every 25000 steps.
 seed_everything: true
 trainer:
   accelerator: gpu
   strategy: ddp_find_unused_parameters_true
   devices: 1
   num_nodes: 1
-  precision: bf16-mixed
+  precision: 16-mixed
   max_epochs: 350
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 999
+  val_check_interval: 25000
   num_sanity_val_steps: 0
   log_every_n_steps: 100
-  limit_train_batches: 25000
   limit_val_batches: 1250
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -20,6 +22,7 @@ trainer:
         dirpath: "../../checkpoints/vqgan/ibq_finetune_ocr_smart_resize"
         save_top_k: -1
         save_last: True
+        every_n_train_steps: 25000
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
       init_args:
         logging_interval: step
@@ -47,8 +50,8 @@ model:
         entropy_loss_weight: 0.05
         gen_loss_weight: 0.1
         lecam_loss_weight: 0.05
-    learning_rate: 1e-4  # 2x base (1e-4 -> 2e-4)
-    scheduler_type: "cosine_annealing"
+    learning_rate: 3e-4  # 2x base (1e-4 -> 2e-4)
+    scheduler_type: None #"cosine_annealing"
     warmup_epochs: 5
     min_learning_rate: 1e-6
     l2_normalize: False
@@ -61,8 +64,9 @@ model:
     resume_lr: null
     lr_drop_epoch: [250, 300]
     ocr_loss: true
-    accumulate_grad_batches: 8
+    accumulate_grad_batches: 768
     gradient_clip_val: 1.0
+    
 
 data:
   class_path: finetune.DataModuleFromConfig
@@ -103,4 +107,7 @@ data:
           skip_files: true
           failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
 
-ckpt_path: null # to resume
+# Resume: use last.ckpt or last-vN.ckpt. With IterableDataset, resuming mid-epoch re-iterates
+# from the start of that epoch (some batches seen twice in that epoch). For exact continuation
+# without duplicate batches, resume from a checkpoint saved at epoch end (e.g. epoch=N-step=XXX.ckpt).
+ckpt_path: /workspace/checkpoints/vqgan/ibq_finetune_ocr_smart_resize/last-v1.ckpt  # resume from last
