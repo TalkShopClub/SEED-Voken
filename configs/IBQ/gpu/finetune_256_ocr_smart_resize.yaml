@@ -11,7 +11,8 @@ trainer:
   num_nodes: 1
   precision: 16-mixed
   max_epochs: 350
-  check_val_every_n_epoch: 999
+  # For step-based validation cadence with IterableDataset, disable epoch gating.
+  check_val_every_n_epoch: null
   val_check_interval: 25000
   num_sanity_val_steps: 0
   log_every_n_steps: 100
