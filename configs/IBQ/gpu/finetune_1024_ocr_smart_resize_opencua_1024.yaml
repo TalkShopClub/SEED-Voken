@@ -1,0 +1,117 @@
+# Fine-tune IBQ-1024 (ImageNet pretrained) on OpenCUA data with smart_resize and OCR loss at 1024×1024 resolution.
+# Starts from /workspace/scripts/SEED-Voken/pretrained/IBQ-Tokenizer-1024/imagenet256_1024.ckpt
+# Training data: /workspace/models/EWM-DataCollection/images/OpenCUA
+# Run: python finetune.py fit -c configs/IBQ/gpu/finetune_1024_ocr_smart_resize_opencua_1024.yaml
+#
+# NOTE: Generate train manifest first if not present:
+#   python scripts/build_opencua_eval_sets.py  (or equivalent) ->
+#   configs/IBQ/gpu/local_opencua_train_image_paths.json
+#
+# Training: one full epoch per epoch (no limit_train_batches). Validation + checkpoint every 25000 steps.
+seed_everything: true
+trainer:
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  devices: 1
+  num_nodes: 1
+  precision: bf16-mixed
+  max_epochs: 350
+  # For step-based validation cadence with IterableDataset, disable epoch gating.
+  check_val_every_n_epoch: null
+  val_check_interval: 25000
+  num_sanity_val_steps: 0
+  log_every_n_steps: 100
+  limit_val_batches: 1250
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/vqgan/ibq_finetune_ocr_smart_resize_opencua_1024_res1024"
+        save_top_k: -1
+        save_last: True
+        every_n_train_steps: 25000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: "../../results/vqgan/ibq_finetune_ocr_smart_resize_opencua_1024_res1024"
+      version: "test"
+      name:
+
+model:
+  class_path: src.IBQ.models.ibqgan.IBQFromPretrained
+  init_args:
+    pretrained_path: "/workspace/scripts/SEED-Voken/pretrained/IBQ-Tokenizer-1024"
+    config_file: "config.yaml"
+    ckpt_file: "imagenet256_1024.ckpt"
+    lossconfig:
+      target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_conditional: False
+        disc_in_channels: 3
+        disc_start: 0
+        disc_weight: 0.4
+        quant_loss_weight: 1.0
+        entropy_loss_weight: 0.05
+        gen_loss_weight: 0.1
+        lecam_loss_weight: 0.05
+    learning_rate: 3e-4  # 2x base (1e-4 -> 2e-4)
+    scheduler_type: None #"cosine_annealing"
+    warmup_epochs: 5
+    min_learning_rate: 1e-6
+    l2_normalize: False
+    use_entropy_loss: True
+    sample_minimization_weight: 1.0
+    batch_maximization_weight: 1.0
+    entropy_temperature: 0.01
+    beta: 0.25
+    use_ema: True
+    resume_lr: null
+    lr_drop_epoch: [250, 300]
+    ocr_loss: true
+    accumulate_grad_batches: 384
+    gradient_clip_val: 1.0
+
+
+data:
+  class_path: finetune.DataModuleFromConfig
+  init_args:
+    batch_size: 2
+    num_workers: 16
+    train:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/local_opencua_train_image_paths.json
+          root: /workspace/models/EWM-DataCollection/images/OpenCUA
+          size: 1024  # SmartResize area=1024², ds_factor=16 (1024 resolution input)
+          random_crop: true
+          original_reso: false
+          skip_files: true
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+    validation:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/eval_opencua_test_20000_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test/OpenCUA-test
+          size: 1024
+          random_crop: false
+          original_reso: false
+          skip_files: true
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+    test:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/eval_opencua_test_20000_image_paths.json
+          root: /workspace/models/EWM-DataCollection/test/OpenCUA-test
+          size: 1024
+          random_crop: false
+          original_reso: false
+          skip_files: true
+          failed_samples_path: configs/IBQ/gpu/local_ibqgan_256_failed_samples.json
+
+# Resume: set to a checkpoint path to resume training, or null to start fresh.
+ckpt_path: null
