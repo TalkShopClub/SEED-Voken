@@ -1,0 +1,107 @@
+# Ablation: text-only L1 loss (Option 1). L1 is zero outside text regions.
+# Discriminator still sees full image for global coherence.
+seed_everything: true
+trainer:
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  devices: 1
+  num_nodes: 1
+  precision: bf16-mixed
+  max_epochs: 5
+  check_val_every_n_epoch: 5
+  num_sanity_val_steps: 0
+  log_every_n_steps: 10
+  limit_val_batches: 10
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "/workspace/users/mike/experiments/ibq_4ch_textonly_l1/checkpoints"
+        save_top_k: -1
+        save_last: True
+        every_n_train_steps: 100
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: "/workspace/users/mike/experiments/ibq_4ch_textonly_l1/logs"
+      version: "v0"
+      name:
+
+model:
+  class_path: src.IBQ.models.ibqgan.IBQFromPretrained
+  init_args:
+    pretrained_path: "/workspace/users/lakshya/data/ibq_1024_pretrained_1024res"
+    config_file: "config.yaml"
+    ckpt_file: "model.ckpt"
+    override_in_channels: 4
+    override_out_ch: 4
+    lossconfig:
+      target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_conditional: False
+        disc_in_channels: 3
+        disc_start: 0
+        disc_weight: 0.4
+        quant_loss_weight: 1.0
+        entropy_loss_weight: 0.05
+        gen_loss_weight: 0.1
+        lecam_loss_weight: 0.05
+    learning_rate: 3e-4
+    scheduler_type: None
+    warmup_epochs: 1
+    min_learning_rate: 1e-6
+    l2_normalize: False
+    use_entropy_loss: True
+    sample_minimization_weight: 1.0
+    batch_maximization_weight: 1.0
+    entropy_temperature: 0.01
+    beta: 0.25
+    use_ema: True
+    resume_lr: null
+    lr_drop_epoch: [4]
+    ocr_loss: false
+    accumulate_grad_batches: 2
+    gradient_clip_val: 1.0
+    # Text mask loss
+    mask_loss_type: "bce"
+    text_mask_loss_weight: 0.2
+    icon_mask_loss_weight: 0.0
+    # No region weighting — using text_only_l1 instead
+    text_region_weight: 0.0
+    icon_region_weight: 0.0
+    # Text-only L1: zero L1 loss outside text regions
+    text_only_l1: true
+
+data:
+  class_path: finetune.DataModuleFromConfig
+  init_args:
+    batch_size: 1
+    num_workers: 4
+    train:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: /workspace/users/mike/data/test_100_image_paths.json
+          root: /workspace/users/mike/data/ibq_finetune_stages/stage_d
+          size: 1024
+          random_crop: true
+          original_reso: false
+          skip_files: false
+          failed_samples_path: ""
+          annotations_path: /workspace/users/mike/data/omniparser_annotations_100.json
+    validation:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: /workspace/users/mike/data/test_100_image_paths.json
+          root: /workspace/users/mike/data/ibq_finetune_stages/stage_d
+          size: 1024
+          random_crop: false
+          original_reso: false
+          skip_files: false
+          failed_samples_path: ""
+          annotations_path: /workspace/users/mike/data/omniparser_annotations_100.json
+
+ckpt_path: null

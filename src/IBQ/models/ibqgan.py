@@ -51,6 +51,17 @@ class VQModel(L.LightningModule):
                 ocr_loss = False,
                 accumulate_grad_batches = 1,
                 min_std_threshold = 1e-2,
+                # Mask channel parameters
+                mask_loss_type = "bce",  # "bce" or "mse"
+                text_mask_loss_weight = 0.0,
+                icon_mask_loss_weight = 0.0,
+                # Region-weighted RGB reconstruction loss
+                text_region_weight = 0.0,
+                icon_region_weight = 0.0,
+                # Text-only L1: zero out L1 loss outside text regions
+                text_only_l1 = False,
+                # Composite mode: blend decoder output with original using text mask
+                composite_mode = False,
                  ):
         super().__init__()
         self.image_key = image_key
@@ -93,6 +104,22 @@ class VQModel(L.LightningModule):
             for p in self.ocr_lpips.parameters():
                 p.requires_grad = False
 
+        # Mask channel loss config
+        self.mask_loss_type = mask_loss_type
+        self.text_mask_loss_weight = text_mask_loss_weight
+        self.icon_mask_loss_weight = icon_mask_loss_weight
+        self._use_mask_loss = (text_mask_loss_weight > 0 or icon_mask_loss_weight > 0)
+        # Whether the model has mask channels (5ch input/output)
+        self._has_mask_channels = ddconfig.get("in_channels", 3) > 3
+        # Region-weighted RGB reconstruction loss
+        self.text_region_weight = text_region_weight
+        self.icon_region_weight = icon_region_weight
+        self._use_region_weight = (text_region_weight > 0 or icon_region_weight > 0)
+        # Text-only L1 mode: L1 loss is zero outside text regions
+        self.text_only_l1 = text_only_l1
+        # Composite mode: blend decoder RGB with original using text mask before loss
+        self.composite_mode = composite_mode
+
         self.strict_loading = False
         self._skip_reasons = [
             "image_retrieval_failed",
@@ -109,6 +136,62 @@ class VQModel(L.LightningModule):
         self._train_skip_epoch = {k: 0 for k in self._skip_reasons}
         self._val_skip_total = {k: 0 for k in self._skip_reasons}
         self._val_skip_epoch = {k: 0 for k in self._skip_reasons}
+
+    def _build_region_weight_map(self, x_masks):
+        """Build a (B, 1, H, W) spatial weight map from ground truth masks.
+        Pixels in text regions get extra weight text_region_weight,
+        pixels in icon regions get extra weight icon_region_weight,
+        all pixels start with base weight 1.0.
+        The map is normalized so its spatial mean is 1.0 — this preserves
+        relative emphasis on text/icon regions without inflating the overall
+        loss magnitude (which would destabilize the L1 vs perceptual vs GAN balance).
+        """
+        B, C, H, W = x_masks.shape
+        weight_map = torch.ones(B, 1, H, W, device=x_masks.device, dtype=x_masks.dtype)
+        if self.text_region_weight > 0:
+            weight_map = weight_map + self.text_region_weight * x_masks[:, 0:1]
+        if self.icon_region_weight > 0 and C > 1:
+            weight_map = weight_map + self.icon_region_weight * x_masks[:, 1:2]
+        # Normalize so spatial mean = 1.0 per sample
+        mean = weight_map.mean(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        weight_map = weight_map / mean
+        return weight_map
+
+    def _split_rgb_masks(self, x):
+        """Split 5-channel tensor into RGB (3ch) and mask targets (2ch).
+        Returns (x_rgb, x_masks) where x_masks is None if input is 3ch."""
+        if self._has_mask_channels and x.shape[1] > 3:
+            return x[:, :3], x[:, 3:]
+        return x, None
+
+    def _compute_mask_loss(self, xrec_masks, x_masks, split="train"):
+        """Compute mask reconstruction loss for text (and optionally icon) channels.
+        xrec_masks: (B, N, H, W) raw decoder output for mask channels (N=1 or 2)
+        x_masks: (B, N, H, W) ground truth masks in [0, 1]
+        """
+        log_dict = {}
+        total_mask_loss = torch.tensor(0.0, device=xrec_masks.device)
+
+        if self.text_mask_loss_weight > 0:
+            if self.mask_loss_type == "bce":
+                text_loss = F.binary_cross_entropy_with_logits(
+                    xrec_masks[:, 0:1], x_masks[:, 0:1])
+            else:  # mse
+                text_loss = F.mse_loss(torch.sigmoid(xrec_masks[:, 0:1]), x_masks[:, 0:1])
+            total_mask_loss = total_mask_loss + self.text_mask_loss_weight * text_loss
+            log_dict[f"{split}/text_mask_loss"] = text_loss.detach()
+
+        if self.icon_mask_loss_weight > 0 and x_masks.shape[1] > 1:
+            if self.mask_loss_type == "bce":
+                icon_loss = F.binary_cross_entropy_with_logits(
+                    xrec_masks[:, 1:2], x_masks[:, 1:2])
+            else:  # mse
+                icon_loss = F.mse_loss(torch.sigmoid(xrec_masks[:, 1:2]), x_masks[:, 1:2])
+            total_mask_loss = total_mask_loss + self.icon_mask_loss_weight * icon_loss
+            log_dict[f"{split}/icon_mask_loss"] = icon_loss.detach()
+
+        log_dict[f"{split}/total_mask_loss"] = total_mask_loss.detach()
+        return total_mask_loss, log_dict
 
     def _ensure_ocr_lpips_frozen_eval(self):
         if self.ocr_lpips is None:
@@ -311,11 +394,12 @@ class VQModel(L.LightningModule):
             self._record_skip("train", "non_finite_input")
             return None
         # Sanity check: skip batch if any image has low channel or low global std (avoids BatchNorm/div issues)
-        
+        # Only check std on RGB channels to avoid mask channels (which can be all-zero) triggering skip
+        x_rgb_for_std = x[:, :3] if self._has_mask_channels else x
         # Per-image min std across channels: (B, C, H, W) -> std over (H,W) per (B,C) -> (B,C) -> min over C -> (B,)
-        min_channel_std = x.view(x.size(0), x.size(1), -1).std(dim=-1).min(dim=1)[0]
-        # Per-image global std: (B, C, H, W) -> (B,) 
-        global_std = x.view(x.size(0), -1).std(dim=-1)
+        min_channel_std = x_rgb_for_std.view(x_rgb_for_std.size(0), x_rgb_for_std.size(1), -1).std(dim=-1).min(dim=1)[0]
+        # Per-image global std: (B, C, H, W) -> (B,)
+        global_std = x_rgb_for_std.view(x_rgb_for_std.size(0), -1).std(dim=-1)
         if not self._all_finite(min_channel_std) or not self._all_finite(global_std):
             self._record_skip("train", "non_finite_input_std")
             return None
@@ -326,6 +410,23 @@ class VQModel(L.LightningModule):
         if not self._all_finite(xrec) or not self._all_finite(qloss):
             self._record_skip("train", "non_finite_forward")
             return None
+
+        # Split into RGB and mask channels for loss computation
+        x_rgb, x_masks = self._split_rgb_masks(x)
+        xrec_rgb, xrec_masks = self._split_rgb_masks(xrec)
+
+        # Composite mode: blend decoder RGB with original using text mask
+        if self.composite_mode and x_masks is not None:
+            text_mask = x_masks[:, 0:1]  # (B, 1, H, W)
+            xrec_rgb = xrec_rgb * text_mask + x_rgb * (1.0 - text_mask)
+
+        # Build region weight map or text-only mask for RGB reconstruction loss
+        region_weight_map = None
+        text_only_mask = None
+        if self.text_only_l1 and x_masks is not None:
+            text_only_mask = x_masks[:, 0:1]  # (B, 1, H, W) binary
+        elif self._use_region_weight and x_masks is not None:
+            region_weight_map = self._build_region_weight_map(x_masks)
 
         opt_gen, opt_disc = self.optimizers()
         if self.scheduler_type != "None":
@@ -347,9 +448,11 @@ class VQModel(L.LightningModule):
             opt_disc.zero_grad()
             opt_gen.zero_grad()
         # original VQGAN first optimizes G, then D. We first optimize D then G, following traditional GAN
-        # optimize discriminator
-        discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
+        # optimize discriminator (RGB only)
+        discloss, log_dict_disc = self.loss(qloss, x_rgb, xrec_rgb, 1, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train",
+                                            region_weight_map=region_weight_map,
+                                            text_only_mask=text_only_mask)
         if not self._all_finite(discloss):
             self._record_skip("train", "non_finite_disc_loss")
             return None
@@ -362,14 +465,16 @@ class VQModel(L.LightningModule):
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
 
-        # optimize generator
-        aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="train")
+        # optimize generator (RGB losses)
+        aeloss, log_dict_ae = self.loss(qloss, x_rgb, xrec_rgb, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="train",
+                                        region_weight_map=region_weight_map,
+                                        text_only_mask=text_only_mask)
         if not self._all_finite(aeloss):
             self._record_skip("train", "non_finite_ae_loss")
             return None
         if self.ocr_loss and self.ocr_lpips is not None:
-            ocr_loss_val = self.ocr_lpips(x, xrec).mean()
+            ocr_loss_val = self.ocr_lpips(x_rgb, xrec_rgb).mean()
             if not self._all_finite(ocr_loss_val):
                 self._record_skip("train", "non_finite_ocr_loss")
                 return None
@@ -378,7 +483,14 @@ class VQModel(L.LightningModule):
                 self._record_skip("train", "non_finite_ae_plus_ocr")
                 return None
             log_dict_ae["train/ocr_loss"] = ocr_loss_val.detach()
-            
+
+        # Mask reconstruction loss
+        if self._use_mask_loss and x_masks is not None and xrec_masks is not None:
+            mask_loss, mask_log_dict = self._compute_mask_loss(xrec_masks, x_masks, split="train")
+            if self._all_finite(mask_loss):
+                aeloss = aeloss + mask_loss
+                log_dict_ae.update(mask_log_dict)
+
         self.manual_backward(aeloss)
 
 
@@ -416,9 +528,10 @@ class VQModel(L.LightningModule):
         if not self._all_finite(x):
             self._record_skip("val", "non_finite_input")
             return {}
-        # Same guards as training: skip batch if any image has low channel or low global std
-        min_channel_std = x.view(x.size(0), x.size(1), -1).std(dim=-1).min(dim=1)[0]
-        global_std = x.view(x.size(0), -1).std(dim=-1)
+        # Same guards as training: skip batch if any image has low channel or low global std (RGB only)
+        x_rgb_for_std = x[:, :3] if self._has_mask_channels else x
+        min_channel_std = x_rgb_for_std.view(x_rgb_for_std.size(0), x_rgb_for_std.size(1), -1).std(dim=-1).min(dim=1)[0]
+        global_std = x_rgb_for_std.view(x_rgb_for_std.size(0), -1).std(dim=-1)
         if not self._all_finite(min_channel_std) or not self._all_finite(global_std):
             self._record_skip("val", "non_finite_input_std")
             return {}
@@ -434,20 +547,47 @@ class VQModel(L.LightningModule):
         if not self._all_finite(x_rec):
             self._record_skip("val", "non_finite_forward")
             return {}
-        aeloss, log_dict_ae = self.loss(qloss, x, x_rec, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="val")
+
+        # Split into RGB and mask channels
+        x_rgb, x_masks = self._split_rgb_masks(x)
+        xrec_rgb, xrec_masks = self._split_rgb_masks(x_rec)
+
+        # Composite mode
+        if self.composite_mode and x_masks is not None:
+            text_mask = x_masks[:, 0:1]
+            xrec_rgb = xrec_rgb * text_mask + x_rgb * (1.0 - text_mask)
+
+        region_weight_map = None
+        text_only_mask = None
+        if self.text_only_l1 and x_masks is not None:
+            text_only_mask = x_masks[:, 0:1]
+        elif self._use_region_weight and x_masks is not None:
+            region_weight_map = self._build_region_weight_map(x_masks)
+
+        aeloss, log_dict_ae = self.loss(qloss, x_rgb, xrec_rgb, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="val",
+                                        region_weight_map=region_weight_map,
+                                        text_only_mask=text_only_mask)
         if not self._all_finite(aeloss):
             self._record_skip("val", "non_finite_ae_loss")
             return {}
         if self.ocr_loss and self.ocr_lpips is not None:
-            ocr_loss_val = self.ocr_lpips(x, x_rec).mean()
+            ocr_loss_val = self.ocr_lpips(x_rgb, xrec_rgb).mean()
             if not self._all_finite(ocr_loss_val):
                 self._record_skip("val", "non_finite_ocr_loss")
                 return {}
             log_dict_ae["val/ocr_loss"] = ocr_loss_val.detach()
 
-        discloss, log_dict_disc = self.loss(qloss, x, x_rec, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val")
+        # Mask reconstruction loss
+        if self._use_mask_loss and x_masks is not None and xrec_masks is not None:
+            mask_loss, mask_log_dict = self._compute_mask_loss(xrec_masks, x_masks, split="val")
+            if self._all_finite(mask_loss):
+                log_dict_ae.update(mask_log_dict)
+
+        discloss, log_dict_disc = self.loss(qloss, x_rgb, xrec_rgb, 1, self.global_step,
+                                            last_layer=self.get_last_layer(), split="val",
+                                            region_weight_map=region_weight_map,
+                                            text_only_mask=text_only_mask)
         if not self._all_finite(discloss):
             self._record_skip("val", "non_finite_disc_loss")
             return {}
@@ -529,13 +669,21 @@ class VQModel(L.LightningModule):
         x = self.get_input(batch, self.image_key)
         x = x.to(self.device)
         xrec, _ = self(x)
-        if x.shape[1] > 3:
-            # colorize with random projection
-            assert xrec.shape[1] > 3
-            x = self.to_rgb(x)
-            xrec = self.to_rgb(xrec)
-        log["inputs"] = x
-        log["reconstructions"] = xrec
+        # Log only RGB channels for visualization
+        x_rgb = x[:, :3] if self._has_mask_channels else x
+        xrec_rgb = xrec[:, :3] if self._has_mask_channels else xrec
+        if self.composite_mode and self._has_mask_channels and x.shape[1] > 3:
+            text_mask = x[:, 3:4]
+            xrec_rgb = xrec_rgb * text_mask + x_rgb * (1.0 - text_mask)
+        log["inputs"] = x_rgb
+        log["reconstructions"] = xrec_rgb
+        # Log mask channels if present
+        if self._has_mask_channels and x.shape[1] > 3:
+            log["text_mask_gt"] = x[:, 3:4].repeat(1, 3, 1, 1)  # expand to 3ch for viz
+            log["text_mask_pred"] = torch.sigmoid(xrec[:, 3:4]).repeat(1, 3, 1, 1)
+            if x.shape[1] > 4:
+                log["icon_mask_gt"] = x[:, 4:5].repeat(1, 3, 1, 1)
+                log["icon_mask_pred"] = torch.sigmoid(xrec[:, 4:5]).repeat(1, 3, 1, 1)
         return log
 
     def to_rgb(self, x):
@@ -579,6 +727,17 @@ class IBQ(VQModel):
                 stage = None,
                 ocr_loss = False,
                 accumulate_grad_batches = 1,
+                # Mask channel parameters
+                mask_loss_type = "bce",
+                text_mask_loss_weight = 0.0,
+                icon_mask_loss_weight = 0.0,
+                # Region-weighted RGB reconstruction loss
+                text_region_weight = 0.0,
+                icon_region_weight = 0.0,
+                # Text-only L1
+                text_only_l1 = False,
+                # Composite mode
+                composite_mode = False,
                  ):
         z_channels = ddconfig["z_channels"]
         super().__init__(ddconfig,
@@ -605,6 +764,13 @@ class IBQ(VQModel):
                         lr_drop_rate = lr_drop_rate,
                         ocr_loss = ocr_loss,
                         accumulate_grad_batches = accumulate_grad_batches,
+                        mask_loss_type = mask_loss_type,
+                        text_mask_loss_weight = text_mask_loss_weight,
+                        icon_mask_loss_weight = icon_mask_loss_weight,
+                        text_region_weight = text_region_weight,
+                        icon_region_weight = icon_region_weight,
+                        text_only_l1 = text_only_l1,
+                        composite_mode = composite_mode,
                         )
         self.quantize = IndexPropagationQuantize(n_embed, embed_dim, beta, use_entropy_loss,
                                           remap=remap, cosine_similarity=cosine_similarity,
@@ -687,6 +853,20 @@ class IBQFromPretrained(IBQ):
         stage=None,
         ocr_loss: bool = False,
         accumulate_grad_batches = 1,
+        # Mask channel parameters
+        mask_loss_type = "bce",
+        text_mask_loss_weight = 0.0,
+        icon_mask_loss_weight = 0.0,
+        # Region-weighted RGB reconstruction loss
+        text_region_weight = 0.0,
+        icon_region_weight = 0.0,
+        # Text-only L1
+        text_only_l1 = False,
+        # Composite mode
+        composite_mode = False,
+        # Override ddconfig channels for 5ch mode
+        override_in_channels = None,
+        override_out_ch = None,
         **kwargs,
     ):
         ignore_keys = ignore_keys or []
@@ -701,6 +881,16 @@ class IBQFromPretrained(IBQ):
                 "Pretrained config must contain ddconfig, n_embed, embed_dim. "
                 f"Got keys: {list(cfg_dict.keys())}"
             )
+
+        # Remember original channel counts from pretrained model before overriding
+        pretrained_in_channels = ddconfig.get("in_channels", 3)
+        pretrained_out_ch = ddconfig.get("out_ch", 3)
+
+        # Override ddconfig channel counts for 5-channel mode
+        if override_in_channels is not None:
+            ddconfig["in_channels"] = override_in_channels
+        if override_out_ch is not None:
+            ddconfig["out_ch"] = override_out_ch
 
         # Optional overrides from pretrained config
         beta = cfg_dict.get("beta", beta)
@@ -741,18 +931,485 @@ class IBQFromPretrained(IBQ):
             cosine_similarity=cosine_similarity,
             ocr_loss=ocr_loss,
             accumulate_grad_batches=accumulate_grad_batches,
+            mask_loss_type=mask_loss_type,
+            text_mask_loss_weight=text_mask_loss_weight,
+            icon_mask_loss_weight=icon_mask_loss_weight,
+            text_region_weight=text_region_weight,
+            icon_region_weight=icon_region_weight,
+            text_only_l1=text_only_l1,
+            composite_mode=composite_mode,
         )
 
-        # Load pretrained generator weights (encoder, decoder, quantize, quant_conv, post_quant_conv)
+        # Load pretrained generator weights, expanding conv_in/conv_out if channel count changed
+        new_in_channels = ddconfig.get("in_channels", 3)
+        new_out_ch = ddconfig.get("out_ch", 3)
+
         generator_prefixes = ("encoder.", "decoder.", "quantize.", "quant_conv.", "post_quant_conv.")
         new_sd = OrderedDict()
         for k, v in state_dict.items():
             if any(k.startswith(p) for p in generator_prefixes):
                 if not any(ig in k for ig in ignore_keys):
                     new_sd[k] = v
+
+        # Expand encoder.conv_in weights if in_channels increased (e.g. 3 -> 5)
+        if new_in_channels > pretrained_in_channels and "encoder.conv_in.weight" in new_sd:
+            old_w = new_sd["encoder.conv_in.weight"]  # (out_ch, old_in, kH, kW)
+            new_w = torch.zeros(old_w.shape[0], new_in_channels, old_w.shape[2], old_w.shape[3],
+                                dtype=old_w.dtype)
+            new_w[:, :pretrained_in_channels] = old_w
+            new_sd["encoder.conv_in.weight"] = new_w
+            print(f"Expanded encoder.conv_in.weight: ({old_w.shape[1]}) -> ({new_in_channels}) channels, "
+                  f"new channels zero-initialized")
+            # bias stays the same shape (out_ch,) — no change needed
+
+        # Expand decoder.conv_out weights if out_ch increased (e.g. 3 -> 5)
+        if new_out_ch > pretrained_out_ch and "decoder.conv_out.weight" in new_sd:
+            old_w = new_sd["decoder.conv_out.weight"]  # (old_out, in_ch, kH, kW)
+            new_w = torch.zeros(new_out_ch, old_w.shape[1], old_w.shape[2], old_w.shape[3],
+                                dtype=old_w.dtype)
+            new_w[:pretrained_out_ch] = old_w
+            new_sd["decoder.conv_out.weight"] = new_w
+            print(f"Expanded decoder.conv_out.weight: ({old_w.shape[0]}) -> ({new_out_ch}) channels, "
+                  f"new channels zero-initialized")
+            # Expand bias too
+            if "decoder.conv_out.bias" in new_sd:
+                old_b = new_sd["decoder.conv_out.bias"]  # (old_out,)
+                new_b = torch.zeros(new_out_ch, dtype=old_b.dtype)
+                new_b[:pretrained_out_ch] = old_b
+                new_sd["decoder.conv_out.bias"] = new_b
+
         missing, unexpected = self.load_state_dict(new_sd, strict=False)
         if missing:
             print(f"IBQFromPretrained: missing keys (expected for loss/disc): {len(missing)}")
         if unexpected:
             print(f"IBQFromPretrained: unexpected keys from checkpoint: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
         print(f"Restored generator from {pretrained_path} ({len(new_sd)} keys)")
+
+
+class IBQResidualFromPretrained(IBQFromPretrained):
+    """
+    IBQ with residual codebook (RVQ-style).
+
+    Frozen pretrained encoder + codebook_1 produce z_q1. A second randomly-
+    initialized codebook quantizes the residual (h - z_q1). A zero-initialized
+    1x1 conv gates the residual contribution so the model starts at pretrained
+    quality and the new codebook's influence grows organically during training.
+
+    Trainable: quantize_residual, residual_proj, post_quant_conv, decoder.
+    Frozen:    encoder, quant_conv, quantize (codebook_1).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Second codebook: same size as pretrained, randomly initialized
+        n_e = self.quantize.n_e
+        e_dim = self.quantize.e_dim
+        self.quantize_residual = IndexPropagationQuantize(
+            n_e, e_dim,
+            beta=self.quantize.beta,
+            use_entropy_loss=True,
+            entropy_temperature=self.quantize.entropy_temperature,
+            sample_minimization_weight=self.quantize.sample_minimization_weight,
+            batch_maximization_weight=self.quantize.batch_maximization_weight,
+        )
+
+        # Zero-initialized projection: at init, residual contribution is zero
+        # so model outputs are identical to pretrained baseline
+        self.residual_proj = torch.nn.Conv2d(e_dim, e_dim, 1, bias=True)
+        torch.nn.init.zeros_(self.residual_proj.weight)
+        torch.nn.init.zeros_(self.residual_proj.bias)
+
+        # Freeze pretrained encoder path
+        for module in [self.encoder, self.quant_conv, self.quantize]:
+            module.eval()
+            for p in module.parameters():
+                p.requires_grad = False
+
+        print(f"[IBQResidual] Residual codebook: {n_e} entries x {e_dim} dim (randomly init)")
+        print(f"[IBQResidual] Frozen: encoder, quant_conv, quantize")
+        print(f"[IBQResidual] Trainable: quantize_residual, residual_proj, post_quant_conv, decoder")
+
+    # ------------------------------------------------------------------
+    # Keep frozen modules in eval even when Lightning calls model.train()
+    # ------------------------------------------------------------------
+    def train(self, mode=True):
+        super().train(mode)
+        if mode:
+            self.encoder.eval()
+            self.quant_conv.eval()
+            self.quantize.eval()
+        return self
+
+    # ------------------------------------------------------------------
+    # Dual-codebook encode
+    # ------------------------------------------------------------------
+    def encode(self, x):
+        # Frozen encoder + quant_conv + codebook_1
+        with torch.no_grad():
+            h = self.encoder(x)
+            h = self.quant_conv(h)
+            z_q1, _loss1, _info1 = self.quantize(h)
+
+        # Residual: what the pretrained codebook discarded
+        residual = h - z_q1  # both detached via no_grad
+
+        # Quantize residual with new codebook (trained)
+        z_q2, emb_loss2, info2 = self.quantize_residual(residual)
+
+        # Zero-init gate — starts as no-op, grows during training
+        z_q2_proj = self.residual_proj(z_q2)
+
+        z_combined = z_q1 + z_q2_proj
+
+        # Diagnostics (logged in on_train_batch_end)
+        self._diag_residual_norm = residual.detach().norm(dim=1).mean()
+        self._diag_proj_norm = z_q2_proj.detach().norm(dim=1).mean()
+        self._diag_proj_scale = (
+            z_q2_proj.detach().norm() / z_q1.detach().norm().clamp(min=1e-8)
+        )
+
+        return z_combined, emb_loss2, info2
+
+    # ------------------------------------------------------------------
+    # Log residual diagnostics
+    # ------------------------------------------------------------------
+    def on_train_batch_end(self, *args, **kwargs):
+        super().on_train_batch_end(*args, **kwargs)
+        for attr, name in [
+            ("_diag_residual_norm", "train/residual_norm"),
+            ("_diag_proj_norm", "train/residual_proj_norm"),
+            ("_diag_proj_scale", "train/residual_proj_scale"),
+        ]:
+            val = getattr(self, attr, None)
+            if val is not None:
+                self.log(name, val, prog_bar=False, logger=True,
+                         on_step=True, on_epoch=False)
+
+    # ------------------------------------------------------------------
+    # Optimizer: only trainable params in generator optimizer
+    # ------------------------------------------------------------------
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        if self.trainer.is_global_zero:
+            print(
+                "[IBQResidual] configure_optimizers: lr={}, scheduler={}".format(
+                    lr, self.scheduler_type
+                )
+            )
+
+        gen_params = (
+            list(self.decoder.parameters()) +
+            list(self.post_quant_conv.parameters()) +
+            list(self.quantize_residual.parameters()) +
+            list(self.residual_proj.parameters())
+        )
+        opt_gen = torch.optim.Adam(gen_params, lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+                                    lr=lr, betas=(0.5, 0.9))
+
+        if self.scheduler_type == "None":
+            return (
+                {"optimizer": opt_gen},
+                {"optimizer": opt_disc, "do_not_count_global_step": True},
+            )
+
+        # Replicate parent scheduler logic for non-None cases
+        batches_per_epoch_raw = (
+            len(self.trainer.datamodule._train_dataloader())
+            // self.trainer.world_size
+        )
+        limit = self.trainer.limit_train_batches
+        if isinstance(limit, int):
+            batches_per_epoch = min(batches_per_epoch_raw, limit)
+        elif isinstance(limit, float) and 0 < limit <= 1:
+            batches_per_epoch = int(batches_per_epoch_raw * limit)
+        else:
+            batches_per_epoch = batches_per_epoch_raw
+        optimizer_steps_per_epoch = max(
+            1, batches_per_epoch // self.accumulate_grad_batches
+        )
+        warmup_steps = optimizer_steps_per_epoch * self.warmup_epochs
+        training_steps = optimizer_steps_per_epoch * self.trainer.max_epochs
+
+        if self.scheduler_type == "linear-warmup":
+            scheduler_ae = torch.optim.lr_scheduler.LambdaLR(
+                opt_gen, Scheduler_LinearWarmup(warmup_steps))
+            scheduler_disc = torch.optim.lr_scheduler.LambdaLR(
+                opt_disc, Scheduler_LinearWarmup(warmup_steps))
+        elif self.scheduler_type == "linear-warmup_cosine-decay":
+            multipler_min = self.min_learning_rate / self.learning_rate
+            scheduler_ae = torch.optim.lr_scheduler.LambdaLR(
+                opt_gen,
+                Scheduler_LinearWarmup_CosineDecay(
+                    warmup_steps=warmup_steps, max_steps=training_steps,
+                    multipler_min=multipler_min))
+            scheduler_disc = torch.optim.lr_scheduler.LambdaLR(
+                opt_disc,
+                Scheduler_LinearWarmup_CosineDecay(
+                    warmup_steps=warmup_steps, max_steps=training_steps,
+                    multipler_min=multipler_min))
+        elif self.scheduler_type == "cosine_annealing":
+            scheduler_ae = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_gen, T_max=training_steps, eta_min=self.min_learning_rate)
+            scheduler_disc = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_disc, T_max=training_steps, eta_min=self.min_learning_rate)
+        else:
+            raise NotImplementedError(
+                f"scheduler_type {self.scheduler_type} not supported"
+            )
+
+        return (
+            {"optimizer": opt_gen, "lr_scheduler": scheduler_ae},
+            {"optimizer": opt_disc, "lr_scheduler": scheduler_disc},
+        )
+
+
+class IBQDualDecoderFromPretrained(IBQFromPretrained):
+    """
+    IBQ with dual decoder: frozen pretrained pipeline for global reconstruction,
+    plus a lightweight text-specialist decoder with its own codebook.
+
+    Path 1 (frozen):  encoder → codebook_1 → decoder_1 → xrec_global
+    Path 2 (trained): text_proj(encoder_features) → codebook_2 → text_decoder → xrec_text
+    Output: pixel-space blend using the text mask.
+
+    Gradients only flow through the text decoder in text regions, so the
+    pretrained quality is fully preserved for non-text areas.
+    """
+
+    def __init__(self, *args, text_decoder_config=None, mask_blur_sigma=2.0,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+
+        n_e = self.quantize.n_e
+        e_dim = self.quantize.e_dim
+        z_ch = self.post_quant_conv.out_channels  # 256
+
+        # ---- text specialist path ----
+        # text_proj: identity-initialized 1x1 conv so text path starts
+        # seeing the same features as the pretrained codebook
+        self.text_proj = torch.nn.Conv2d(e_dim, e_dim, 1, bias=True)
+        torch.nn.init.eye_(self.text_proj.weight.view(e_dim, e_dim))
+        self.text_proj.weight.data = self.text_proj.weight.data.view(
+            e_dim, e_dim, 1, 1)
+        torch.nn.init.zeros_(self.text_proj.bias)
+
+        # text codebook: copy pretrained codebook weights
+        self.quantize_text = IndexPropagationQuantize(
+            n_e, e_dim,
+            beta=self.quantize.beta,
+            use_entropy_loss=True,
+            entropy_temperature=self.quantize.entropy_temperature,
+            sample_minimization_weight=self.quantize.sample_minimization_weight,
+            batch_maximization_weight=self.quantize.batch_maximization_weight,
+        )
+        self.quantize_text.embedding.weight.data.copy_(
+            self.quantize.embedding.weight.data)
+
+        # post_quant_conv_text: copy from pretrained
+        self.post_quant_conv_text = torch.nn.Conv2d(e_dim, z_ch, 1)
+        self.post_quant_conv_text.weight.data.copy_(
+            self.post_quant_conv.weight.data)
+        self.post_quant_conv_text.bias.data.copy_(
+            self.post_quant_conv.bias.data)
+
+        # text decoder: same architecture as pretrained, initialized from
+        # pretrained weights. Uses out_ch=3 (RGB only, no mask channel).
+        pretrained_ddconfig = self.encoder.ch  # just need to read arch
+        td_cfg = dict(
+            ch=self.decoder.ch,
+            out_ch=3,
+            ch_mult=[1, 1, 2, 2, 4],
+            num_res_blocks=self.decoder.num_res_blocks,
+            attn_resolutions=[16],
+            dropout=0.0,
+            in_channels=3,
+            resolution=256,
+            z_channels=z_ch,
+        )
+        if text_decoder_config is not None:
+            td_cfg.update(text_decoder_config)
+        self.text_decoder = Decoder(**td_cfg)
+
+        # Copy pretrained decoder weights into text decoder
+        pretrained_sd = self.decoder.state_dict()
+        text_sd = self.text_decoder.state_dict()
+        new_text_sd = OrderedDict()
+        for k, v in pretrained_sd.items():
+            if k not in text_sd:
+                continue
+            if text_sd[k].shape == v.shape:
+                new_text_sd[k] = v.clone()
+            elif k == "conv_out.weight":
+                # pretrained: (4, 128, 3, 3) → text: (3, 128, 3, 3)
+                new_text_sd[k] = v[:3].clone()
+            elif k == "conv_out.bias":
+                # pretrained: (4,) → text: (3,)
+                new_text_sd[k] = v[:3].clone()
+        missing, unexpected = self.text_decoder.load_state_dict(
+            new_text_sd, strict=False)
+        n_copied = len(new_text_sd)
+        n_total = len(text_sd)
+        print(f"[IBQDualDecoder] Text decoder: copied {n_copied}/{n_total} "
+              f"tensors from pretrained decoder"
+              f"{f' (missing: {missing})' if missing else ''}")
+
+        self.mask_blur_sigma = mask_blur_sigma
+
+        # ---- freeze entire pretrained pipeline ----
+        for module in [self.encoder, self.quant_conv, self.quantize,
+                       self.post_quant_conv, self.decoder]:
+            module.eval()
+            for p in module.parameters():
+                p.requires_grad = False
+
+        text_dec_params = sum(p.numel() for p in self.text_decoder.parameters())
+        print(f"[IBQDualDecoder] Text codebook: {n_e} x {e_dim} "
+              f"(init from pretrained)")
+        print(f"[IBQDualDecoder] Text decoder: {text_dec_params:,} params")
+        print(f"[IBQDualDecoder] Frozen: encoder, quant_conv, quantize, "
+              f"post_quant_conv, decoder")
+        print(f"[IBQDualDecoder] Trainable: text_proj, quantize_text, "
+              f"post_quant_conv_text, text_decoder")
+
+    # ------------------------------------------------------------------
+    def train(self, mode=True):
+        super().train(mode)
+        if mode:
+            for m in [self.encoder, self.quant_conv, self.quantize,
+                      self.post_quant_conv, self.decoder]:
+                m.eval()
+        return self
+
+    # ------------------------------------------------------------------
+    def _blur_mask(self, mask):
+        """Apply Gaussian blur to text mask for soft blending edges."""
+        if self.mask_blur_sigma <= 0:
+            return mask
+        import torchvision.transforms.functional as TF
+        ks = int(6 * self.mask_blur_sigma + 1)
+        if ks % 2 == 0:
+            ks += 1
+        return TF.gaussian_blur(mask, kernel_size=[ks, ks],
+                                sigma=[self.mask_blur_sigma] * 2)
+
+    # ------------------------------------------------------------------
+    def encode(self, x):
+        # Frozen pretrained encoder + codebook
+        with torch.no_grad():
+            h = self.encoder(x)
+            h = self.quant_conv(h)
+            z_q1, _loss1, _info1 = self.quantize(h)
+
+        # Text specialist: project encoder features → text codebook
+        h_text = self.text_proj(h)  # h detached via no_grad
+        z_q2, emb_loss2, info2 = self.quantize_text(h_text)
+
+        # Cache for decode()
+        self._cached_z_q1 = z_q1
+        self._cached_input = x
+
+        return z_q2, emb_loss2, info2
+
+    # ------------------------------------------------------------------
+    def decode(self, quant_text):
+        # Frozen global reconstruction
+        with torch.no_grad():
+            xrec_global = self.decoder(
+                self.post_quant_conv(self._cached_z_q1))
+
+        # Text specialist reconstruction (RGB only)
+        xrec_text = self.text_decoder(
+            self.post_quant_conv_text(quant_text))
+
+        # Blend using text mask from input
+        inp = self._cached_input
+        if inp.shape[1] > 3:
+            text_mask = inp[:, 3:4]
+            mask_soft = self._blur_mask(text_mask)
+            xrec_rgb = (xrec_global[:, :3] * (1 - mask_soft)
+                        + xrec_text * mask_soft)
+            # Keep mask channel from frozen decoder for mask-loss logging
+            xrec = torch.cat([xrec_rgb, xrec_global[:, 3:]], dim=1)
+        else:
+            xrec = xrec_global
+
+        return xrec
+
+    # ------------------------------------------------------------------
+    def get_last_layer(self):
+        # Adaptive disc weight must reference the trainable decoder
+        return self.text_decoder.conv_out.weight
+
+    # ------------------------------------------------------------------
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        if self.trainer.is_global_zero:
+            print(f"[IBQDualDecoder] configure_optimizers: lr={lr}, "
+                  f"scheduler={self.scheduler_type}")
+
+        gen_params = (
+            list(self.text_proj.parameters()) +
+            list(self.quantize_text.parameters()) +
+            list(self.post_quant_conv_text.parameters()) +
+            list(self.text_decoder.parameters())
+        )
+        opt_gen = torch.optim.Adam(gen_params, lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+                                    lr=lr, betas=(0.5, 0.9))
+
+        if self.scheduler_type == "None":
+            return (
+                {"optimizer": opt_gen},
+                {"optimizer": opt_disc, "do_not_count_global_step": True},
+            )
+
+        batches_per_epoch_raw = (
+            len(self.trainer.datamodule._train_dataloader())
+            // self.trainer.world_size
+        )
+        limit = self.trainer.limit_train_batches
+        if isinstance(limit, int):
+            batches_per_epoch = min(batches_per_epoch_raw, limit)
+        elif isinstance(limit, float) and 0 < limit <= 1:
+            batches_per_epoch = int(batches_per_epoch_raw * limit)
+        else:
+            batches_per_epoch = batches_per_epoch_raw
+        optimizer_steps_per_epoch = max(
+            1, batches_per_epoch // self.accumulate_grad_batches
+        )
+        warmup_steps = optimizer_steps_per_epoch * self.warmup_epochs
+        training_steps = optimizer_steps_per_epoch * self.trainer.max_epochs
+
+        if self.scheduler_type == "linear-warmup":
+            scheduler_ae = torch.optim.lr_scheduler.LambdaLR(
+                opt_gen, Scheduler_LinearWarmup(warmup_steps))
+            scheduler_disc = torch.optim.lr_scheduler.LambdaLR(
+                opt_disc, Scheduler_LinearWarmup(warmup_steps))
+        elif self.scheduler_type == "linear-warmup_cosine-decay":
+            multipler_min = self.min_learning_rate / self.learning_rate
+            scheduler_ae = torch.optim.lr_scheduler.LambdaLR(
+                opt_gen,
+                Scheduler_LinearWarmup_CosineDecay(
+                    warmup_steps=warmup_steps, max_steps=training_steps,
+                    multipler_min=multipler_min))
+            scheduler_disc = torch.optim.lr_scheduler.LambdaLR(
+                opt_disc,
+                Scheduler_LinearWarmup_CosineDecay(
+                    warmup_steps=warmup_steps, max_steps=training_steps,
+                    multipler_min=multipler_min))
+        elif self.scheduler_type == "cosine_annealing":
+            scheduler_ae = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_gen, T_max=training_steps, eta_min=self.min_learning_rate)
+            scheduler_disc = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_disc, T_max=training_steps, eta_min=self.min_learning_rate)
+        else:
+            raise NotImplementedError(
+                f"scheduler_type {self.scheduler_type} not supported"
+            )
+
+        return (
+            {"optimizer": opt_gen, "lr_scheduler": scheduler_ae},
+            {"optimizer": opt_disc, "lr_scheduler": scheduler_disc},
+        )

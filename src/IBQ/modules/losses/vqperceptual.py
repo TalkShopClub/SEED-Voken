@@ -137,8 +137,17 @@ class VQLPIPSWithDiscriminator(nn.Module):
         return d_weight
 
     def forward(self, codebook_loss, inputs, reconstructions, optimizer_idx,
-                global_step, last_layer=None, cond=None, split="train"):
+                global_step, last_layer=None, cond=None, split="train",
+                region_weight_map=None, text_only_mask=None):
         rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
+        if text_only_mask is not None:
+            # text_only_mask: (B, 1, H, W), binary 0/1
+            # Zero out L1 loss outside text regions — only text pixels contribute
+            rec_loss = rec_loss * text_only_mask
+        elif region_weight_map is not None:
+            # region_weight_map: (B, 1, H, W), normalized to mean=1.0
+            # Weight the per-pixel L1 loss so masked regions contribute more
+            rec_loss = rec_loss * region_weight_map
         nll_loss = rec_loss.clone()
         if self.perceptual_weight > 0:
             p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())

@@ -8,7 +8,7 @@ import random
 from botocore.exceptions import ClientError
 
 from src.IBQ.util import retrieve, KeyNotFoundError
-from src.IBQ.data.base import IterableImagePaths, load_image, load_image_bytes
+from src.IBQ.data.base import IterableImagePaths, load_image, load_image_bytes, load_annotations
 from src.IBQ.data.image_resize import SmartResize
 from src.manifest_utils import (
     ensure_manifest,
@@ -396,12 +396,14 @@ class LocalImagesBase(IterableDataset):
             log.info("Removed %d files during filtering.", n_before - len(abspaths))
         relpaths = [os.path.relpath(p, self.root) for p in abspaths]
         labels = {"relpath": np.array(relpaths)}
+        annotations_path = retrieve(self.config, "annotations_path", default=None)
         self.data = IterableImagePaths(
             abspaths,
             size=retrieve(self.config, "size", default=0),
             random_crop=self.random_crop,
             original_reso=retrieve(self.config, "original_reso", default=False),
             labels=labels,
+            annotations_path=annotations_path,
         )
         log.info("Loaded %d images from manifest (root: %s)", len(self.data), self.root)
 
@@ -421,12 +423,14 @@ class LocalImagesBase(IterableDataset):
             "relpath": np.array(relpaths),
         }
 
+        annotations_path = retrieve(self.config, "annotations_path", default=None)
         self.data = IterableImagePaths(
             abspaths,
             size=retrieve(self.config, "size", default=0),
             random_crop=self.random_crop,
             original_reso=retrieve(self.config, "original_reso", default=False),
             labels=labels,
+            annotations_path=annotations_path,
         )
         log.info("Found %d images in %s", len(self.data), self.root)
 

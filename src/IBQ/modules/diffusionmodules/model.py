@@ -172,24 +172,19 @@ class AttnBlock(nn.Module):
         k = self.k(h_)
         v = self.v(h_)
 
-        # compute attention
-        b,c,h,w = q.shape
-        q = q.reshape(b,c,h*w)
-        q = q.permute(0,2,1)   # b,hw,c
-        k = k.reshape(b,c,h*w) # b,c,hw
-        w_ = torch.bmm(q,k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
+        # Use F.scaled_dot_product_attention (fused, memory-efficient)
+        b, c, h, w = q.shape
+        # Reshape to (b, 1, hw, c) — single-head attention over spatial positions
+        q = q.reshape(b, c, h * w).permute(0, 2, 1).unsqueeze(1)  # b,1,hw,c
+        k = k.reshape(b, c, h * w).permute(0, 2, 1).unsqueeze(1)  # b,1,hw,c
+        v = v.reshape(b, c, h * w).permute(0, 2, 1).unsqueeze(1)  # b,1,hw,c
 
-        # attend to values
-        v = v.reshape(b,c,h*w)
-        w_ = w_.permute(0,2,1)   # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(v,w_)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = h_.reshape(b,c,h,w)
+        h_ = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # b,1,hw,c
+        h_ = h_.squeeze(1).permute(0, 2, 1).reshape(b, c, h, w)  # b,c,h,w
 
         h_ = self.proj_out(h_)
 
-        return x+h_
+        return x + h_
 
 
 class Model(nn.Module):
