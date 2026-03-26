@@ -1,0 +1,127 @@
+# OCR-Enhanced IBQ Training Config
+#
+# Trains a bidirectional fusion transformer + IBQ decoder to reconstruct images
+# from the combination of:
+#   • frozen IBQ discrete image tokens  (encoder frozen from pretrained IBQ)
+#   • OCR text tokens extracted by frozen PaddleOCR-VL-1.5
+#
+# Data resolution : 1024×1024  (for high-quality OCR on desktop screenshots)
+# IBQ resolution  :  256×256   (matches pretrained IBQ – encoder frozen)
+# Image tokens    :   16×16 = 256 discrete tokens per image
+#
+# Frozen :  IBQ encoder, quant_conv, quantize, PaddleOCR-VL-1.5, LPIPS
+# Trained:  img_tok_emb, img_pos_emb, txt_tok_emb, txt_pos_emb, modality_emb,
+#           fusion_blocks, fusion_norm, proj_to_codebook, post_quant_conv, decoder
+
+seed_everything: 42
+
+trainer:
+  accelerator: gpu
+  strategy: auto
+  devices: 1
+  num_nodes: 1
+  precision: bf16-mixed
+  max_epochs: 10
+  check_val_every_n_epoch: 2
+  num_sanity_val_steps: 1
+  log_every_n_steps: 10
+  accumulate_grad_batches: 4
+  gradient_clip_val: 1.0
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "checkpoints/ocr_enhanced_ibq"
+        filename: "epoch={epoch:03d}-val_rec={val/rec:.4f}"
+        save_top_k: 3
+        save_last: true
+        monitor: "val/rec"
+        mode: min
+        auto_insert_metric_name: false
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "seed-voken-ocr"
+      name: "ocr_enhanced_ibq_1000img_10ep"
+      save_dir: "results/ocr_enhanced_ibq"
+
+model:
+  class_path: src.IBQ.models.ocr_enhanced_ibq.OCREnhancedIBQ
+  init_args:
+    # ── IBQ architecture (matches pretrained checkpoint) ──────────────
+    ddconfig:
+      double_z: false
+      z_channels: 256
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 1, 2, 2, 4]   # 4 downsampling stages → 256/16=16 → 16×16=256 tokens
+      num_res_blocks: 4
+      attn_resolutions: [16]
+      dropout: 0.0
+
+    n_embed: 1024
+    embed_dim: 256
+
+    # Pretrained IBQ tokenizer (3-channel, trained at 256×256)
+    ibq_ckpt_path: "checkpoints/pretrained/imagenet256_1024.ckpt"
+
+    # ── Resolution: OCR at 1024px, IBQ encode/decode at 256px ─────────
+    ibq_input_size: 1024  # no resize; encoder receives full-res → 64×64 latent grid
+    output_size: 1024     # decoder natively outputs 1024 via 4 upsample stages
+
+    # ── Fusion transformer ─────────────────────────────────────────────
+    d_model: 512
+    n_heads: 8
+    n_layers: 6
+    ffn_dim_multiplier: 4
+    dropout: 0.1
+
+    # ── Text / OCR ─────────────────────────────────────────────────────
+    text_max_len: 128         # max byte-level tokens per image
+    ocr_model_name: "PaddlePaddle/PaddleOCR-VL-1.5"
+    ocr_max_new_tokens: 256
+    ocr_cache_path: "ocr_cache.json"
+
+    # ── Loss weights ───────────────────────────────────────────────────
+    rec_loss_weight: 1.0
+    perceptual_loss_weight: 1.0
+
+    # ── Optimiser ──────────────────────────────────────────────────────
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-2
+    warmup_steps: 200
+
+    image_key: "image"
+    fp_key: "file_path_"
+
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 1
+    num_workers: 4
+    train:
+      target: src.IBQ.data.ocr_image_dataset.OCRImageTrain
+      params:
+        config:
+          data_root: "data"
+          size: 1024        # load at 1024px for OCR quality
+          random_crop: true
+    validation:
+      target: src.IBQ.data.ocr_image_dataset.OCRImageValidation
+      params:
+        config:
+          data_root: "data"
+          size: 1024
+    test:
+      target: src.IBQ.data.ocr_image_dataset.OCRImageValidation
+      params:
+        config:
+          data_root: "data"
+          size: 1024
+
+ckpt_path: null
