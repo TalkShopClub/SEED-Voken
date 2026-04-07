@@ -485,7 +485,7 @@ class IndexPropagationQuantize(nn.Module):
             diff = 0.0
             z_q = einsum('b n h w, n d -> b d h w', hard_one_hot, embedding)
 
-        if self.use_entropy_loss:
+        if self.use_entropy_loss and self.training:
             sample_entropy, avg_entropy, entropy_loss = compute_entropy_loss(
                 logits=logits.permute(0, 2, 3, 1).reshape(-1, self.n_e),
                 temperature=self.entropy_temperature,

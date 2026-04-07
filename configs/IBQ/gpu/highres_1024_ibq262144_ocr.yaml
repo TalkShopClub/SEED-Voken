@@ -1,0 +1,106 @@
+# Train IBQ-262144 encoder-decoder from scratch at 1024x1024 resolution.
+# Data: ubuntu + win/mac GUI screenshots (~431K images, 1% held out for val)
+# Run: python main.py fit -c configs/IBQ/gpu/highres_1024_ibq262144_ocr.yaml
+seed_everything: true
+trainer:
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  devices: 1
+  num_nodes: 1
+  precision: bf16-mixed
+  max_epochs: 100
+  check_val_every_n_epoch: null
+  val_check_interval: 5000
+  num_sanity_val_steps: 0
+  log_every_n_steps: 50
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/vqgan/ibq_highres_1024_262144_ocr"
+        save_top_k: 2
+        monitor: "val/reconstruct_loss_epoch"
+        mode: "min"
+        save_last: True
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: src.IBQ.callbacks.wandb_image_logger.WandbReconstructionLogger
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "ibq-highres-1024"
+      name: "ibq262144-1024-ocr"
+      save_dir: "../../results/vqgan/ibq_highres_1024_262144_ocr"
+
+model:
+  class_path: src.IBQ.models.ibqgan.IBQ
+  init_args:
+    ddconfig:
+      double_z: False
+      z_channels: 256
+      resolution: 1024
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 1, 2, 2, 4]  # 4 downsamples -> 16x reduction -> 64x64 tokens
+      num_res_blocks: 4
+      attn_resolutions: [64]     # attention at bottleneck (1024/16=64)
+      dropout: 0.0
+
+    lossconfig:
+      target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_conditional: False
+        disc_in_channels: 3
+        disc_start: 0
+        disc_weight: 0.4
+        quant_loss_weight: 1.0
+        entropy_loss_weight: 0.05
+        gen_loss_weight: 0.1
+        lecam_loss_weight: 0.05
+
+    n_embed: 262144
+    embed_dim: 256
+    learning_rate: 1e-4
+    l2_normalize: False
+    use_entropy_loss: True
+    sample_minimization_weight: 1.0
+    batch_maximization_weight: 1.0
+    entropy_temperature: 0.01
+    beta: 0.25
+    use_ema: True
+    resume_lr: null
+    lr_drop_epoch: [70, 90]
+    ocr_loss: true
+    accumulate_grad_batches: 64
+    gradient_clip_val: 1.0
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 1
+    num_workers: 16
+    train:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/highres_1024_train_image_paths.json
+          root: /workspace/AgentNet
+          size: 1024
+          random_crop: true
+          original_reso: false
+          skip_files: false
+          failed_samples_path: ""
+    validation:
+      target: src.IBQ.data.s3_images.LocalImages
+      params:
+        config:
+          manifest_path: configs/IBQ/gpu/highres_1024_val_image_paths.json
+          root: /workspace/AgentNet
+          size: 1024
+          random_crop: false
+          original_reso: false
+          skip_files: false
+          failed_samples_path: ""
+
+ckpt_path: null
