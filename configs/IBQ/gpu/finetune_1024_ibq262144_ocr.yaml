@@ -21,7 +21,6 @@ trainer:
         monitor: "val/reconstruct_loss_epoch"
         mode: "min"
         save_last: True
-        every_n_train_steps: 5000
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
       init_args:
         logging_interval: step

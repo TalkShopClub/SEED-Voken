@@ -1,6 +1,6 @@
-# Fine-tune IBQ-16384 from pretrained (ImageNet) on GUI screenshots at 1024x1024.
+# Fine-tune IBQ-8192 from pretrained (ImageNet) on GUI screenshots at 736x736.
 # Data: ubuntu + win/mac (~427K train, ~4.3K val)
-# Run: python finetune.py fit -c configs/IBQ/gpu/finetune_1024_ibq16384_ocr.yaml
+# Run: python finetune.py fit -c configs/IBQ/gpu/finetune_1024_ibq8192_ocr.yaml
 seed_everything: true
 trainer:
   accelerator: gpu
@@ -10,13 +10,13 @@ trainer:
   precision: bf16-mixed
   max_epochs: 10
   check_val_every_n_epoch: null
-  val_check_interval: 5000
+  val_check_interval: 10000
   num_sanity_val_steps: 0
   log_every_n_steps: 50
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: "checkpoints/ibq_finetune_1024_16384_ocr"
+        dirpath: "checkpoints/ibq_finetune_1024_8192_ocr"
         save_top_k: 2
         monitor: "val/reconstruct_loss_epoch"
         mode: "min"
@@ -29,15 +29,15 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: "ibq-highres-1024"
-      name: "finetune-ibq16384-1024-ocr"
-      save_dir: "results/ibq_finetune_1024_16384_ocr"
+      name: "finetune-ibq8192-736-ocr"
+      save_dir: "results/ibq_finetune_1024_8192_ocr"
 
 model:
   class_path: src.IBQ.models.ibqgan.IBQFromPretrained
   init_args:
-    pretrained_path: "pretrained/IBQ-Tokenizer-16384"
+    pretrained_path: "pretrained/IBQ-Tokenizer-8192"
     config_file: "config.yaml"
-    ckpt_file: "imagenet256_16384.ckpt"
+    ckpt_file: "imagenet256_8192.ckpt"
     lossconfig:
       target: src.IBQ.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
       params:
